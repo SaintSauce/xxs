@@ -79,10 +79,12 @@ class SFTTrainer:
         # load splits
         splits = load_split_dataset_from_hf(
             dataset_name=self.dataset_name,
-            splits=self.ratios,
+            sft_ratio=self.ratios["sft"],
+            rl_ratio=self.ratios["rl"],
+            val_ratio=self.ratios["val"],
             seed=self.seed
         )
-        sft_raw = splits["sft"]
+        sft_raw = splits["sft_train"]
 
         # load tokenizer
         _, self.tokenizer = self.model_loader.load()
