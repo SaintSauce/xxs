@@ -1,4 +1,15 @@
+# config
+IPython
+pyyaml
+python-dotenv
+
+# HF
 datasets
-matplotlib
-torch
 transformers
+
+# EDA
+matplotlib
+seaborn
+
+# ML
+torch

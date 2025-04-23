@@ -1,3 +1,28 @@
 seed: 42
-model_name: "Qwen/Qwen2.5-0.5B"
 dataset_name: "openai/gsm8k"
+model_name: "Qwen/Qwen2.5-0.5B"
+
+# data split ratios
+split_ratios:
+  sft: 0.8
+  rl: 0.1
+  val: 0.1
+
+# prompt + CoT length
+max_length: int = 512
+
+# training hyperparams
+learning_rate: float = 2e-5
+batch_size: int = 8
+grad_accum_steps: int = 4
+num_epochs: int = 3
+weight_decay: float = 0.01
+warmup_steps: int = 100
+
+# num workers for data loading
+num_workers: int = 4
+
+# output dirs
+sft_output_dir: sft_checkpoint
+ppo_output_dir: ppo_checkpoint
+grpo_output_dir: grpo_checkpoint
