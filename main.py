@@ -40,6 +40,7 @@ def main():
         print(f"Using model: {model_name}")
 
         print("Loading dataset...")
+
         df = setup_df(model_name)
 
         print("Dataset loaded successfully")
@@ -77,3 +78,6 @@ def main():
         run_evaluation(config, device)
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
+    
+if __name__ == "__main__":
+    main()
