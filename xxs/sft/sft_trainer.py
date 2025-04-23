@@ -54,6 +54,25 @@ class SFTTrainer:
         self.loader       = None
         self.model        = None
 
+    def _verify_save(self, save_dir: str) -> bool:
+        """ verify that model and tokenizer files are properly saved """
+
+        required_files = [
+            "config.json",
+            "pytorch_model.bin",
+            "tokenizer_config.json",
+            "vocab.json",
+            "merges.txt",
+            "special_tokens_map.json"
+        ]
+        
+        for file in required_files:
+            file_path = os.path.join(save_dir, file)
+            if not os.path.exists(file_path):
+                print(f"Warning: Required file {file} not found in {save_dir}")
+                return False
+        return True
+
     def prepare_data(self):
         """ load and preprocess the dataset """
         
@@ -161,9 +180,19 @@ class SFTTrainer:
             ckpt = os.path.join(self.output_dir, f"epoch{epoch}")
             self.model.save_pretrained(ckpt)
             self.tokenizer.save_pretrained(ckpt)
-            print(f"Saved checkpoint: {ckpt}")
+            
+            # Verify checkpoint save
+            if self._verify_save(ckpt):
+                print(f"Successfully saved and verified checkpoint: {ckpt}")
+            else:
+                print(f"Warning: Checkpoint verification failed for {ckpt}")
 
         # final save
         self.model.save_pretrained(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
-        print(f"SFT complete. Model + tokenizer in {self.output_dir}")
+        
+        # Verify final save
+        if self._verify_save(self.output_dir):
+            print(f"SFT complete. Model + tokenizer successfully saved and verified in {self.output_dir}")
+        else:
+            print(f"Warning: Final model save verification failed in {self.output_dir}")
