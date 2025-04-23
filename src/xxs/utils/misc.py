@@ -22,10 +22,10 @@ def hf_login():
     load_dotenv()
 
     hf_token = os.getenv("HF_TOKEN")
-    
+
     if not hf_token:
         raise ValueError("HF_TOKEN not found in environment")
-    
+
     login(
         token=hf_token, 
         add_to_git_credential=True

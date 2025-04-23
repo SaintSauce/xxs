@@ -6,6 +6,7 @@ from xxs.exploration.eda import (
 )
 from xxs.utils.misc import set_seed
 
+import os
 import torch
 import argparse
 from xxs.utils.misc import hf_login
@@ -25,6 +26,8 @@ def main():
     seed = config.get("seed")
     dataset_name = config.get("dataset_name")
     model_name = config.get("model_name")
+
+    print(f"HF_TOKEN: {os.getenv('HF_TOKEN')}")
 
     hf_login()
 
