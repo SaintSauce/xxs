@@ -4,7 +4,7 @@ from transformers import (
     AutoModelForCausalLM,
     get_linear_schedule_with_warmup
 )
-from transformers.optimization import AdamW
+from torch.optim import AdamW
 from xxs.utils.data import (
     load_split_dataset_from_hf,
     format_cot_prompt,
