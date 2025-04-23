@@ -10,10 +10,22 @@ from xxs.utils.explore import (
 
 def setup_df(model_name: str) -> pd.DataFrame:
     """ load dataset and add features """
-
+    
+    print(f"Loading dataset with model: {model_name}")
+    
     df = load_dataset_split()
+    
+    print("Dataset loaded successfully")
+    print("Adding character length features...")
+    
     df = add_char_length_features(df)
+    
+    print("Adding token length features...")
+    print(f"Loading tokenizer for model: {model_name}")
+    
     df = add_token_length_features(df, AutoTokenizer.from_pretrained(model_name))
+    
+    print("Features added successfully")
     
     return df
 

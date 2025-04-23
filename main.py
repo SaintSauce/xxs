@@ -36,17 +36,28 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.mode == "eda":
-        df = setup_df(dataset_name)
+        print(f"Exploring dataset: {dataset_name}")
+        print(f"Using model: {model_name}")
+
+        print("Loading dataset...")
+        df = setup_df(model_name)
+
+        print("Dataset loaded successfully")
+        print(f"Dataset stats: {df.describe()}")
+
+        print("Plotting character length distribution...")
 
         # chars stats
         plot_char_length_distribution(df, question=True)
         plot_char_length_distribution(df, question=False)
 
+        print("Plotting token length distribution...")
+
         # tokens stats
         plot_token_length_distribution(df, question=True)
         plot_token_length_distribution(df, question=False)
 
-        # do more exploration
+        print("EDA completed!")
 
     # TODO: add sft
     elif args.mode == "sft":

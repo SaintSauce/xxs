@@ -45,8 +45,8 @@ def drop_duplicate(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates(subset=['question', 'answer'])
 
 def load_dataset_split(
-    dataset_name: str,
-    split: str, 
+    dataset_name: str = "openai/gsm8k",
+    split: str = "train", 
     clean: bool = True
 ) -> pd.DataFrame:
     """ load dataset and return as pandas df for the given split """
