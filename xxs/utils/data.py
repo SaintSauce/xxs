@@ -60,7 +60,9 @@ def get_dataloader(
     dataset,
     batch_size: int,
     shuffle: bool,
-    num_workers: int
+    num_workers: int,
+    pin_memory: bool = True,
+    drop_last: bool = False
 ) -> DataLoader:
     """ return pytorch dataloader """
 
@@ -69,5 +71,6 @@ def get_dataloader(
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
+        drop_last=drop_last
     )
