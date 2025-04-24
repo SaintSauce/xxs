@@ -27,7 +27,7 @@ class SFTTrainer:
         self.seed           = config.get("seed")
         self.max_length     = int(config.get("max_length"))
         self.batch_size     = config.get("sft_batch_size")
-        self.num_workers    = config.get("num_workers")
+        self.num_workers    = int(config.get("num_workers"))
         self.lr             = config.get("learning_rate")
         self.weight_decay   = config.get("weight_decay")
         self.num_epochs     = config.get("num_epochs")
