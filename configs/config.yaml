@@ -9,7 +9,7 @@ split_ratios:
   val: 0.1
 
 # prompt + CoT length
-max_length: int = 512
+max_length: 512
 
 # training hyperparams
 learning_rate: float = 2e-5

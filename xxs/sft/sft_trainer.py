@@ -14,7 +14,6 @@ from xxs.utils.data import (
 )
 from xxs.utils.config import ConfigLoader
 from xxs.models.load_model import HFModelLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
 
 class SFTTrainer:
     """ supervised fine-tuning trainer for CoT data, with plotting """
