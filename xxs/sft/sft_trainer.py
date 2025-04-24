@@ -147,6 +147,9 @@ class SFTTrainer:
             prompt = format_cot_prompt(ex["question"])
             return self.tokenizer(
                 prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_length,
                 return_tensors="pt"
             )
 
@@ -287,11 +290,10 @@ class SFTTrainer:
             print(f"Final model saved & verified in {self.output_dir}")
 
         evaluator = ModelEvaluator(
-            config    = self.config,      # keep a copy in __init__: self.config = config
+            config    = self.config,
             device    = self.device,
-            model     = self.model,       # pass in-memory model
-            tokenizer = self.tokenizer    # pass in-memory tokenizer
-            # ckpt_dir = self.output_dir  # (alternate: load from disk instead)
+            model     = self.model,
+            tokenizer = self.tokenizer
         )
         test_metrics = evaluator.evaluate(0)  # prints 5 examples
 

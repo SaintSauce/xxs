@@ -1,96 +1,107 @@
 import os
 import math
+from collections import defaultdict
+
 import torch
-import numpy as np
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
     get_linear_schedule_with_warmup
 )
-from torch.optim import AdamW
+
 from xxs.utils.data import (
     load_split_dataset_from_hf,
     format_cot_prompt,
-    combine_prompt_answer,
     get_dataloader
 )
-from xxs.utils.config import ConfigLoader
-from xxs.models.load_model import HFModelLoader
+from xxs.evaluation.eval_model import ModelEvaluator
 
 class PPOTrainer:
-    """ PPO trainer for RL fine-tuning """
-    
-    def __init__(self, config: ConfigLoader, device: torch.device):
-        
-        # load config fields
-        self.dataset_name   = config.get("dataset_name")
-        self.model_name     = config.get("model_name")
-        self.ratios         = config.get("split_ratios")
-        self.seed           = int(config.get("seed"))
-        self.max_length     = int(config.get("max_length"))
-        self.batch_size     = int(config.get("batch_size"))
-        self.num_workers    = int(config.get("num_workers"))
-        self.lr             = float(config.get("learning_rate"))
-        self.weight_decay   = float(config.get("weight_decay"))
-        self.num_epochs     = int(config.get("num_epochs"))
-        self.grad_accum     = int(config.get("grad_accum_steps"))
-        self.warmup_steps   = int(config.get("warmup_steps"))
-        
-        # PPO specific parameters
-        self.ppo_epochs     = int(config.get("ppo_epochs", 4))
-        self.clip_epsilon   = float(config.get("clip_epsilon", 0.2))
-        self.gamma          = float(config.get("gamma", 0.99))
-        self.lam            = float(config.get("lam", 0.95))
-        self.entropy_coef   = float(config.get("entropy_coef", 0.01))
-        self.value_coef     = float(config.get("value_coef", 0.5))
+    """ ppo trainer """
 
-        raw_output_dir      = config.get("ppo_output_dir", "ppo_checkpoint")
-        repo_root           = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..","..","..")
+    def __init__(self, config, device: torch.device):
+
+        # store config and device
+        self.config = config
+        self.device = device
+
+        # RL data parameters
+        self.dataset_name = config.get("dataset_name")
+        self.seed = int(config.get("seed"))
+        self.ratios = config.get("split_ratios")
+
+        # generation settings
+        self.max_length = int(config.get("max_length"))
+        self.gen_max_new_tokens = int(config.get("gen_max_new_tokens", 128))
+
+        # PPO hyperparameters
+        self.batch_size = int(config.get("rl_batch_size"))
+        self.ppo_epochs = int(config.get("ppo_epochs", 4))
+        self.clip_eps = float(config.get("ppo_clip_eps", 0.2))
+        self.gamma = float(config.get("gamma", 0.99))
+        self.lam = float(config.get("gae_lambda", 0.95))
+        self.beta = float(config.get("kl_coef", 0.1))
+        self.alpha = float(config.get("verifier_coef", 0.5))
+        self.max_updates = int(config.get("max_updates", 1000))
+        self.save_interval = int(config.get("save_interval", 50))
+
+        # output directory
+        raw_dir = config.get("rl_output_dir", "ppo_ckpt")
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..")
         )
-        self.output_dir     = os.path.join(repo_root, raw_output_dir)
+        self.output_dir = os.path.join(repo_root, raw_dir)
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self.device         = device
-        self.model_loader   = HFModelLoader(self.model_name, device)
+        # load policy and reference from local SFT checkpoint
+        sft_dir = config.get("sft_output_dir", "sft_checkpoint")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            sft_dir,
+            trust_remote_code=True
+        )
 
-        # placeholders
-        self.tokenizer      = None
-        self.loader         = None
-        self.val_loader     = None
-        self.val_answers    = None
-        self.model          = None
-        self.old_model      = None  # for PPO
+        # use bfloat16 if supported
+        self.policy = AutoModelForCausalLM.from_pretrained(
+            sft_dir,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16
+        ).to(self.device)
+
+        # reference for KL penalty
+        self.reference = AutoModelForCausalLM.from_pretrained(
+            sft_dir,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16
+        ).to(self.device)
+
+        self.reference.eval()
+
+        # optimizer and scheduler
+        lr = float(config.get("rl_learning_rate", 1e-5))
+        
+        self.optimizer = torch.optim.AdamW(self.policy.parameters(), lr=lr)
+        
+        total_steps = self.max_updates
+
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(config.get("rl_warmup_steps", 200)),
+            num_training_steps=total_steps
+        )
+
+        # placeholder for data loader and gold answers
+        self.loader = None
+        self.gold_answers = []
 
         # metrics history
-        self.epochs         = []
-        self.train_steps    = []
-        self.train_loss     = []
-        self.val_loss       = []
-        self.val_acc        = []
-        self.returns        = []  # for tracking returns
-        self.advantages     = []  # for tracking advantages
-
-    def _verify_save(self, save_dir: str) -> bool:
-        required = [
-            "config.json", "pytorch_model.bin",
-            "tokenizer_config.json", "vocab.json",
-            "merges.txt", "special_tokens_map.json"
-        ]
-        
-        for fn in required:
-            if not os.path.exists(os.path.join(save_dir, fn)):
-                print(f"Warning: missing {fn} in {save_dir}")
-                return False
-        
-        return True
+        self.metrics = defaultdict(list)
 
     def prepare_data(self):
-        """ load model & tokenizer, split data, and build loaders """
-        
-        self.model, self.tokenizer = self.model_loader.load()
-        self.old_model = self.model_loader.load()[0]  # create copy for PPO
+        """ load RL prompts and build DataLoader of raw CoT prompts """
 
-        # splits
         splits = load_split_dataset_from_hf(
             dataset_name=self.dataset_name,
             seed=self.seed,
@@ -99,215 +110,178 @@ class PPOTrainer:
             val_ratio=self.ratios["val"]
         )
         rl_raw = splits["rl_train"]
-        val_raw = splits["val"]
 
-        # RL loader
+        self.gold_answers = [ex["answer"].strip() for ex in rl_raw]
+
         def prep_rl(ex):
             prompt = format_cot_prompt(ex["question"])
-            return self.tokenizer(
-                prompt, truncation=True, padding="max_length",
-                max_length=self.max_length, return_tensors="pt"
-            )
+            return self.tokenizer(prompt, return_tensors="pt")
 
         rl_ds = rl_raw.map(prep_rl, remove_columns=rl_raw.column_names)
         rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        
+
         self.loader = get_dataloader(
-            rl_ds, batch_size=self.batch_size,
-            shuffle=True, num_workers=self.num_workers,
-            pin_memory=True, drop_last=True
+            rl_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=int(self.config.get("num_workers"))
         )
 
-        # val loader (for accuracy)
-        def prep_val(ex):
-            prompt = format_cot_prompt(ex["question"])
-            return self.tokenizer(
-                prompt, truncation=True, padding="max_length",
-                max_length=self.max_length, return_tensors="pt"
-            )
-
-        val_ds = val_raw.map(prep_val, remove_columns=val_raw.column_names)
-        val_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    def _generate_batch(self, batch):
+        """ generate CoT sequences and compute log-probs of those sequences """
         
-        self.val_loader = get_dataloader(
-            val_ds, batch_size=1,
-            shuffle=False, num_workers=self.num_workers,
-            pin_memory=True
+        b = {
+            k: v.squeeze(1).to(self.device) for k, v in batch.items()
+        }
+
+        gen_out = self.policy.generate(
+            **b,
+            do_sample=True,
+            max_new_tokens=self.gen_max_new_tokens,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            return_dict_in_generate=True,
+            output_scores=True
         )
 
-        # gold answers for accuracy
-        self.val_answers = [ex["answer"].strip() for ex in val_raw]
+        seqs = gen_out.sequences
+        log_probs = []
+        input_lens = (b["input_ids"] != self.tokenizer.pad_token_id).sum(dim=-1)
+        
+        for i, scores in enumerate(gen_out.scores):
+            token_ids = seqs[:, input_lens[0] + i].unsqueeze(-1)
+            step_lp = F.log_softmax(scores, dim=-1).gather(1, token_ids)
+            log_probs.append(step_lp.squeeze(1))
+        
+        old_logp = torch.stack(log_probs, dim=1).sum(dim=1).detach()
+        
+        return seqs, old_logp
 
-    def compute_returns_and_advantages(self, rewards, values, dones):
-        """ compute returns and advantages using GAE """
+    def _compute_rewards(self, seqs, old_logp):
+        """ compute final-answer reward + verifier bonus - KL penalty """
         
-        returns = []
-        advantages = []
-        gae = 0
+        final_rewards = []
         
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_value = 0
-                next_done = 1
-            else:
-                next_value = values[t + 1]
-                next_done = dones[t + 1]
+        for s, gold in zip(seqs, self.gold_answers):
+            txt = self.tokenizer.decode(s, skip_special_tokens=True)
+            pred = txt.strip().split()[-1]
+            final_rewards.append(1.0 if pred == gold else 0.0)
+        
+        final_rewards = torch.tensor(final_rewards, device=self.device)
+
+        verifier_bonus = []
+        
+        # verifier loaded in train()
+        for s in seqs:
+            txt = self.tokenizer.decode(s, skip_special_tokens=True)
+            cot = txt.split("A:")[-1]
+            steps = [step.strip() for step in cot.split('.') if step.strip()]
+            enc = self.verifier_tok(
+                steps,
+                padding=True,
+                truncation=True,
+                max_length=64,
+                return_tensors="pt"
+            ).to(self.device)
             
-            delta = rewards[t] + self.gamma * next_value * (1 - next_done) - values[t]
-            gae = delta + self.gamma * self.lam * (1 - next_done) * gae
-            returns.insert(0, gae + values[t])
-            advantages.insert(0, gae)
-        
-        return torch.tensor(returns), torch.tensor(advantages)
-
-    def ppo_loss(self, logprobs, old_logprobs, advantages, values, returns):
-        """ compute PPO loss """
-        
-        ratio = torch.exp(logprobs - old_logprobs)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        
-        value_loss = 0.5 * (returns - values).pow(2).mean()
-        
-        entropy_loss = -logprobs.mean()
-        
-        return policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy_loss
-
-    @torch.no_grad()
-    def evaluate(self):
-        """ return (val_loss, val_accuracy) for current model """
-        
-        self.model.eval()
-        
-        # exact-match accuracy
-        correct = 0
-        
-        for i, batch in enumerate(self.val_loader):
-            b = {k: v.squeeze(1).to(self.device) for k,v in batch.items()}
-            out_ids = self.model.generate(**b, max_new_tokens=128)
-            txt = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
-            pred_ans = txt.strip().split()[-1]
-            gold_ans = self.val_answers[i].split()[-1]
+            with torch.no_grad():
+                logits = self.verifier(**enc).logits
+                probs = torch.softmax(logits, dim=-1)[:, 1]
             
-            if pred_ans == gold_ans:
-                correct += 1
+            verifier_bonus.append(probs.mean())
         
-        acc = correct / len(self.val_loader) * 100
-        self.model.train()
-        return 0.0, acc  # No loss computation in PPO evaluation
+        verifier_bonus = torch.stack(verifier_bonus).to(self.device) * self.alpha
 
-    def _save_plots(self):
-        """ plot & save training metrics """
+        with torch.no_grad():
+            kl_terms = (old_logp - self._ref_logp(seqs)).detach()
+            kl = kl_terms.mean() * self.beta
+
+        self.metrics['answer_acc'].append(final_rewards.mean().item())
+        self.metrics['verifier_bonus'].append(verifier_bonus.mean().item())
+        self.metrics['kl_penalty'].append(kl.item())
+
+        return final_rewards + verifier_bonus - kl
+
+    def _ref_logp(self, seqs):
+
+        # compute log-probs of reference model
+        logp_ref = []
         
-        # loss curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.train_steps, self.train_loss, label="Train Loss")
-        plt.xlabel("Update Step")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.title("PPO Loss Curve")
-        plt.savefig(os.path.join(self.output_dir, "loss_curve.png"))
-        plt.close()
+        for s in seqs:
+            out = self.reference(input_ids=s.unsqueeze(0), labels=s.unsqueeze(0))
+            total_logp = -out.loss.item() * s.size(0)
+            logp_ref.append(total_logp)
+        
+        return torch.tensor(logp_ref, device=self.device)
 
-        # returns curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.train_steps, self.returns, label="Returns")
-        plt.xlabel("Update Step")
-        plt.ylabel("Returns")
-        plt.title("PPO Returns")
+    def _plot(self):
+        
+        # plot reward components over updates
+        updates = range(len(self.metrics['total_reward']))
+        
+        plt.figure(figsize=(8, 5))
+        plt.plot(updates, self.metrics['total_reward'], label='Total Reward')
+        plt.plot(updates, self.metrics['answer_acc'], label='Answer Acc')
+        plt.plot(updates, self.metrics['verifier_bonus'], label='Verifier Bonus')
+        plt.plot(updates, self.metrics['kl_penalty'], label='KL Penalty')
+        plt.xlabel('Update')
+        plt.ylabel('Value')
+        plt.title('Reward Components Over Updates')
         plt.legend()
-        plt.savefig(os.path.join(self.output_dir, "returns_curve.png"))
-        plt.close()
-
-        # accuracy curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.epochs, self.val_acc, marker="o", label="Val Accuracy")
-        plt.xlabel("Epoch")
-        plt.ylabel("Accuracy (%)")
-        plt.title("Validation Accuracy")
-        plt.legend()
-        plt.savefig(os.path.join(self.output_dir, "accuracy_curve.png"))
+        plt.savefig(os.path.join(self.output_dir, 'reward_components.png'))
         plt.close()
 
     def train(self):
-        """ run PPO training with per-epoch validation and final plotting """
+        from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
         
-        optimizer = AdamW(self.model.parameters(),
-                         lr=self.lr,
-                         weight_decay=self.weight_decay)
-        
-        total_steps = math.ceil(len(self.loader)/self.grad_accum) * self.num_epochs
-        
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=total_steps
+        # load verifier tokenizer and model
+        self.verifier_tok = DistilBertTokenizerFast.from_pretrained(
+            'verifier_ckpt_from_answer'
         )
 
-        global_step = 0
-
-        for epoch in range(1, self.num_epochs + 1):
-            self.epochs.append(epoch)
-            running_loss = 0.0
-
-            for step, batch in enumerate(self.loader, start=1):
-                b = {k: v.to(self.device) for k,v in batch.items()}
-                
-                # generate responses and compute rewards
-                with torch.no_grad():
-                    self.old_model.eval()
-                    old_outputs = self.old_model(**b)
-                    old_logprobs = old_outputs.logits.log_softmax(dim=-1)
-                    old_values = old_outputs.value
-                
-                self.model.train()
-                outputs = self.model(**b)
-                logprobs = outputs.logits.log_softmax(dim=-1)
-                values = outputs.value
-                
-                # compute rewards (placeholder - implement your reward function)
-                rewards = torch.ones_like(values)  # replace with actual reward computation
-                dones = torch.zeros_like(rewards)
-                
-                # compute returns and advantages
-                returns, advantages = self.compute_returns_and_advantages(
-                    rewards, values, dones
-                )
-                
-                # normalize advantages
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                
-                # PPO loss
-                loss = self.ppo_loss(logprobs, old_logprobs, advantages, values, returns)
-                loss = loss / self.grad_accum
-                loss.backward()
-                
-                running_loss += loss.item()
-                
-                if step % self.grad_accum == 0:
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    
-                    global_step += 1
-                    self.train_steps.append(global_step)
-                    self.train_loss.append(running_loss / self.grad_accum)
-                    self.returns.append(returns.mean().item())
-                    self.advantages.append(advantages.mean().item())
-                    
-                    running_loss = 0.0
-                    
-                    # update old model
-                    self.old_model.load_state_dict(self.model.state_dict())
-            
-            # evaluate at end of epoch
-            val_loss, val_acc = self.evaluate()
-            self.val_loss.append(val_loss)
-            self.val_acc.append(val_acc)
-            
-            print(f"Epoch {epoch}: Val Acc = {val_acc:.2f}%")
+        self.verifier = DistilBertForSequenceClassification.from_pretrained(
+            'verifier_ckpt_from_answer'
+        ).to(self.device)
         
-        # save final model and plots
-        self.model.save_pretrained(self.output_dir)
-        self._save_plots()
+        self.verifier.eval()
+
+        self.prepare_data()
+
+        for update in range(self.max_updates):
+            batch = next(iter(self.loader))
+            seqs, old_logp = self._generate_batch(batch)
+            rewards = self._compute_rewards(seqs, old_logp)
+            returns = rewards.flip(0).cumsum(0).flip(0)
+            advantages = returns - returns.mean()
+            self.metrics['total_reward'].append(rewards.mean().item())
+
+            for _ in range(self.ppo_epochs):
+                _, new_logp = self._generate_batch(batch)
+                ratio = (new_logp - old_logp).exp()
+                clipped = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps)
+                obj = torch.min(ratio * advantages, clipped * advantages)
+                loss = -obj.mean()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                self.scheduler.step()
+                self.metrics['surrogate_loss'].append(loss.item())
+
+            if update % self.save_interval == 0:
+                ckpt = os.path.join(self.output_dir, f"update_{update}")
+                self.policy.save_pretrained(ckpt)
+                self.tokenizer.save_pretrained(ckpt)
+
+        self.policy.save_pretrained(self.output_dir)
+        self.tokenizer.save_pretrained(self.output_dir)
+
+        evaluator = ModelEvaluator(
+            config=self.config,
+            device=self.device,
+            model=self.policy,
+            tokenizer=self.tokenizer
+        )
+        test_res = evaluator.evaluate(num_samples=0)
+        print(f"Final Test Accuracy: {test_res['test_accuracy']:.2f}%")
+
+        self._plot()
