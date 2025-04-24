@@ -23,9 +23,10 @@ warmup_steps: 100
 num_workers: 4
 
 # output dirs
-sft_output_dir: "sft_checkpoint"
-ppo_output_dir: "ppo_checkpoint"
-grpo_output_dir: "grpo_checkpoint"
+sft_output_dir: "checkpoints/sft_checkpoint"
+ppo_output_dir: "checkpoints/ppo_checkpoint"
+grpo_output_dir: "checkpoints/grpo_checkpoint"
+verifier_dir: "checkpoints/verifier_ckpt_from_answer"
 
 # RL (PPO & G-RPO) hyperparameters
 rl_batch_size:      8           # how many prompts per RL update
