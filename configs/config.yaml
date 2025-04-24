@@ -12,17 +12,17 @@ split_ratios:
 max_length: 512
 
 # training hyperparams
-learning_rate: float = 2e-5
-batch_size: int = 8
-grad_accum_steps: int = 4
-num_epochs: int = 3
-weight_decay: float = 0.01
-warmup_steps: int = 100
+learning_rate: 2e-5
+batch_size: 8
+grad_accum_steps: 4
+num_epochs: 3
+weight_decay: 0.01
+warmup_steps: 100
 
 # num workers for data loading
-num_workers: int = 4
+num_workers: 4
 
 # output dirs
-sft_output_dir: sft_checkpoint
-ppo_output_dir: ppo_checkpoint
-grpo_output_dir: grpo_checkpoint
+sft_output_dir: "sft_checkpoint"
+ppo_output_dir: "ppo_checkpoint"
+grpo_output_dir: "grpo_checkpoint"
