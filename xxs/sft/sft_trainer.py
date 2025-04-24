@@ -106,7 +106,7 @@ class SFTTrainer:
             labels = tk["input_ids"].copy()
             
             # mask out prompt tokens
-            labels[:p_len] = -100
+            labels[:p_len] = [-100] * p_len
 
             tk["labels"] = labels
             
