@@ -33,10 +33,6 @@ def main():
 
     set_seed(seed)
 
-    # for hf
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_OFFLINE"]   = "1"
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.mode == "eda":
