@@ -65,6 +65,9 @@ class PPOTrainer:
             trust_remote_code=True
         )
 
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
         # use bfloat16 if supported
         self.policy = AutoModelForCausalLM.from_pretrained(
             sft_dir,
@@ -254,14 +257,16 @@ class PPOTrainer:
 
         self.prepare_data()
 
+        data_iter = iter(self.loader)
+
         for update in range(self.max_updates):
 
-            # start of a new epoch
-            if update % len(self.loader) == 0:
+            # refresh iterator only when exhausted
+            try:
+                batch = next(data_iter)
+            except StopIteration:
                 data_iter = iter(self.loader)
-
-            # get batch
-            batch = next(data_iter)
+                batch = next(data_iter)
 
             # generate CoT sequences and compute log-probs of those sequences
             seqs, old_logp = self._generate_batch(batch)
