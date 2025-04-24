@@ -341,5 +341,8 @@ class GRPOTrainer:
             print(f"Epoch {epoch}: Val Acc = {val_acc:.2f}%")
         
         # Save final model and plots
-        self.model.save_pretrained(self.output_dir)
+        self.model.save_pretrained(
+            self.output_dir,
+            safe_serialization=True
+        )
         self._save_plots()

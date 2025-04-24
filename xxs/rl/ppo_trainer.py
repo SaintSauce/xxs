@@ -308,12 +308,24 @@ class PPOTrainer:
             # save model
             if update % self.save_interval == 0:
                 ckpt = os.path.join(self.output_dir, f"update_{update}")
-                self.policy.save_pretrained(ckpt)
-                self.tokenizer.save_pretrained(ckpt)
+                self.policy.save_pretrained(
+                    ckpt,
+                    safe_serialization=True
+                )
+                self.tokenizer.save_pretrained(
+                    ckpt,
+                    safe_serialization=True
+                )
 
         # save final model
-        self.policy.save_pretrained(self.output_dir)
-        self.tokenizer.save_pretrained(self.output_dir)
+        self.policy.save_pretrained(
+            self.output_dir,
+            safe_serialization=True
+        )
+        self.tokenizer.save_pretrained(
+            self.output_dir,
+            safe_serialization=True
+        )
 
         # evaluate final model
         evaluator = ModelEvaluator(
