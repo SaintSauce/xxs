@@ -18,6 +18,9 @@ from xxs.evaluation.eval_model import ModelEvaluator
 from xxs.utils.config import ConfigLoader
 from xxs.models.load_model import HFModelLoader
 
+# remove spam thing
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 class SFTTrainer:
     """ supervised fine-tuning trainer for CoT data, with plotting """
     
@@ -271,7 +274,7 @@ class SFTTrainer:
                     scheduler.step()
                     optimizer.zero_grad()
 
-            # Calculate average loss for this epoch
+            # calculate average loss for this epoch
             avg_epoch_loss = running_loss / num_batches
             self.train_loss.append(avg_epoch_loss)
             print(f"[Epoch {epoch}] Average loss: {avg_epoch_loss:.4f}")
@@ -288,7 +291,7 @@ class SFTTrainer:
             self.val_loss.append(val_l)
             self.val_acc.append(val_a)
 
-            # optional verify
+            # verify file
             if self._verify_save(ckpt):
                 print(f"Verified checkpoint: {ckpt}")
 
@@ -306,7 +309,7 @@ class SFTTrainer:
             model     = self.model,
             tokenizer = self.tokenizer
         )
-        test_metrics = evaluator.evaluate(0)  # prints 5 examples
+        test_metrics = evaluator.evaluate(0)  # doesn't print 5 examples
 
         print(
             f"Test Accuracy: {test_metrics['test_accuracy']:.2f}% "
