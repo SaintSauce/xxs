@@ -59,10 +59,15 @@ class PPOTrainer:
         os.makedirs(self.output_dir, exist_ok=True)
 
         # load policy and reference from local SFT checkpoint
-        sft_dir = config.get("sft_output_dir", "sft_checkpoint")
+        sft_rel = config.get("sft_output_dir", "sft_checkpoint")
+        sft_dir = os.path.join(repo_root, sft_rel)
+        
+        print(f"Loading SFT checkpoint from {sft_dir}")
+
         self.tokenizer = AutoTokenizer.from_pretrained(
             sft_dir,
-            trust_remote_code=True
+            trust_remote_code=True,
+            local_files_only=True
         )
 
         if self.tokenizer.pad_token_id is None:
@@ -71,6 +76,7 @@ class PPOTrainer:
         # use bfloat16 if supported
         self.policy = AutoModelForCausalLM.from_pretrained(
             sft_dir,
+            local_files_only=True,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16
         ).to(self.device)
@@ -78,6 +84,7 @@ class PPOTrainer:
         # reference for KL penalty
         self.reference = AutoModelForCausalLM.from_pretrained(
             sft_dir,
+            local_files_only=True,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16
         ).to(self.device)
@@ -244,15 +251,15 @@ class PPOTrainer:
     def train(self):
         from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
         
-        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..","..",".."))
+        repo_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..")
+        )
         verifier_dir = os.path.join(repo_root, "verifier_ckpt_from_answer")
 
-        # load verifier tokenizer and model
         self.verifier_tok = DistilBertTokenizerFast.from_pretrained(
             verifier_dir,
             local_files_only=True
         )
-
         self.verifier = DistilBertForSequenceClassification.from_pretrained(
             verifier_dir,
             local_files_only=True
