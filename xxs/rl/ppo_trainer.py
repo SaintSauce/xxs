@@ -17,9 +17,10 @@ from xxs.utils.config import ConfigLoader
 from xxs.models.load_model import HFModelLoader
 
 class PPOTrainer:
-    """ proximal policy optimization trainer for RL fine-tuning """
+    """ PPO trainer for RL fine-tuning """
     
     def __init__(self, config: ConfigLoader, device: torch.device):
+        
         # load config fields
         self.dataset_name   = config.get("dataset_name")
         self.model_name     = config.get("model_name")
@@ -75,14 +76,17 @@ class PPOTrainer:
             "tokenizer_config.json", "vocab.json",
             "merges.txt", "special_tokens_map.json"
         ]
+        
         for fn in required:
             if not os.path.exists(os.path.join(save_dir, fn)):
                 print(f"Warning: missing {fn} in {save_dir}")
                 return False
+        
         return True
 
     def prepare_data(self):
         """ load model & tokenizer, split data, and build loaders """
+        
         self.model, self.tokenizer = self.model_loader.load()
         self.old_model = self.model_loader.load()[0]  # create copy for PPO
 
@@ -135,7 +139,8 @@ class PPOTrainer:
         self.val_answers = [ex["answer"].strip() for ex in val_raw]
 
     def compute_returns_and_advantages(self, rewards, values, dones):
-        """Compute returns and advantages using GAE"""
+        """ compute returns and advantages using GAE """
+        
         returns = []
         advantages = []
         gae = 0
@@ -156,7 +161,8 @@ class PPOTrainer:
         return torch.tensor(returns), torch.tensor(advantages)
 
     def ppo_loss(self, logprobs, old_logprobs, advantages, values, returns):
-        """Compute PPO loss"""
+        """ compute PPO loss """
+        
         ratio = torch.exp(logprobs - old_logprobs)
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
@@ -170,11 +176,13 @@ class PPOTrainer:
 
     @torch.no_grad()
     def evaluate(self):
-        """Return (val_loss, val_accuracy) for current model"""
+        """ return (val_loss, val_accuracy) for current model """
+        
         self.model.eval()
         
         # exact-match accuracy
         correct = 0
+        
         for i, batch in enumerate(self.val_loader):
             b = {k: v.squeeze(1).to(self.device) for k,v in batch.items()}
             out_ids = self.model.generate(**b, max_new_tokens=128)
@@ -190,7 +198,8 @@ class PPOTrainer:
         return 0.0, acc  # No loss computation in PPO evaluation
 
     def _save_plots(self):
-        """Plot & save training metrics"""
+        """ plot & save training metrics """
+        
         # loss curve
         plt.figure(figsize=(8,6))
         plt.plot(self.train_steps, self.train_loss, label="Train Loss")
@@ -222,7 +231,8 @@ class PPOTrainer:
         plt.close()
 
     def train(self):
-        """Run PPO training with per-epoch validation and final plotting"""
+        """ run PPO training with per-epoch validation and final plotting """
+        
         optimizer = AdamW(self.model.parameters(),
                          lr=self.lr,
                          weight_decay=self.weight_decay)
@@ -244,7 +254,7 @@ class PPOTrainer:
             for step, batch in enumerate(self.loader, start=1):
                 b = {k: v.to(self.device) for k,v in batch.items()}
                 
-                # Generate responses and compute rewards
+                # generate responses and compute rewards
                 with torch.no_grad():
                     self.old_model.eval()
                     old_outputs = self.old_model(**b)
@@ -256,16 +266,16 @@ class PPOTrainer:
                 logprobs = outputs.logits.log_softmax(dim=-1)
                 values = outputs.value
                 
-                # Compute rewards (placeholder - implement your reward function)
-                rewards = torch.ones_like(values)  # Replace with actual reward computation
+                # compute rewards (placeholder - implement your reward function)
+                rewards = torch.ones_like(values)  # replace with actual reward computation
                 dones = torch.zeros_like(rewards)
                 
-                # Compute returns and advantages
+                # compute returns and advantages
                 returns, advantages = self.compute_returns_and_advantages(
                     rewards, values, dones
                 )
                 
-                # Normalize advantages
+                # normalize advantages
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                 
                 # PPO loss
@@ -288,16 +298,16 @@ class PPOTrainer:
                     
                     running_loss = 0.0
                     
-                    # Update old model
+                    # update old model
                     self.old_model.load_state_dict(self.model.state_dict())
             
-            # Evaluate at end of epoch
+            # evaluate at end of epoch
             val_loss, val_acc = self.evaluate()
             self.val_loss.append(val_loss)
             self.val_acc.append(val_acc)
             
             print(f"Epoch {epoch}: Val Acc = {val_acc:.2f}%")
         
-        # Save final model and plots
+        # save final model and plots
         self.model.save_pretrained(self.output_dir)
         self._save_plots()

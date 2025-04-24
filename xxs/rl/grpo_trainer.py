@@ -20,6 +20,7 @@ class GRPOTrainer:
     """ generalized reward-penalty optimization trainer for RL fine-tuning """
     
     def __init__(self, config: ConfigLoader, device: torch.device):
+        
         # load config fields
         self.dataset_name   = config.get("dataset_name")
         self.model_name     = config.get("model_name")
@@ -77,14 +78,17 @@ class GRPOTrainer:
             "tokenizer_config.json", "vocab.json",
             "merges.txt", "special_tokens_map.json"
         ]
+        
         for fn in required:
             if not os.path.exists(os.path.join(save_dir, fn)):
                 print(f"Warning: missing {fn} in {save_dir}")
                 return False
+        
         return True
 
     def prepare_data(self):
         """ load model & tokenizer, split data, and build loaders """
+        
         self.model, self.tokenizer = self.model_loader.load()
         self.old_model = self.model_loader.load()[0]  # create copy for GRPO
 
@@ -137,7 +141,8 @@ class GRPOTrainer:
         self.val_answers = [ex["answer"].strip() for ex in val_raw]
 
     def compute_returns_and_advantages(self, rewards, values, dones):
-        """Compute returns and advantages using GAE"""
+        """ compute returns and advantages using GAE """
+        
         returns = []
         advantages = []
         gae = 0
@@ -158,15 +163,18 @@ class GRPOTrainer:
         return torch.tensor(returns), torch.tensor(advantages)
 
     def compute_penalty(self, logprobs, old_logprobs, actions):
-        """Compute penalty term based on action distribution divergence"""
+        """ compute penalty term based on action distribution divergence """
+        
         # KL divergence between current and old policy
         kl_div = (old_logprobs - logprobs).exp() * (old_logprobs - logprobs)
-        # Additional penalty for actions that deviate too much from the old policy
+        
+        # additional penalty for actions that deviate too much from the old policy
         action_penalty = torch.abs(actions - torch.mean(actions, dim=1, keepdim=True))
         return (kl_div + action_penalty).mean()
 
     def grpo_loss(self, logprobs, old_logprobs, advantages, values, returns, actions):
-        """Compute GRPO loss with penalty term"""
+        """ compute GRPO loss with penalty term """
+        
         # PPO-like policy loss
         ratio = torch.exp(logprobs - old_logprobs)
         surr1 = ratio * advantages
@@ -209,7 +217,8 @@ class GRPOTrainer:
         return 0.0, acc  # No loss computation in GRPO evaluation
 
     def _save_plots(self):
-        """Plot & save training metrics"""
+        """ plot & save training metrics """
+        
         # loss curve
         plt.figure(figsize=(8,6))
         plt.plot(self.train_steps, self.train_loss, label="Train Loss")
@@ -251,7 +260,8 @@ class GRPOTrainer:
         plt.close()
 
     def train(self):
-        """Run GRPO training with per-epoch validation and final plotting"""
+        """ run GRPO training with per-epoch validation and final plotting """
+        
         optimizer = AdamW(self.model.parameters(),
                          lr=self.lr,
                          weight_decay=self.weight_decay)

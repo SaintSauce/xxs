@@ -10,8 +10,11 @@ from xxs.utils.data import (
     load_split_dataset_from_hf,
     format_cot_prompt,
     combine_prompt_answer,
-    get_dataloader
+    get_dataloader,
+    extract_predicted_answer,
+    extract_gold_answer
 )
+from xxs.evaluation.eval_model import ModelEvaluator
 from xxs.utils.config import ConfigLoader
 from xxs.models.load_model import HFModelLoader
 
@@ -21,6 +24,9 @@ class SFTTrainer:
     def __init__(self, config: ConfigLoader, device: torch.device):
         
         # load config fields
+        self.config         = config
+
+        # life is long
         self.dataset_name   = config.get("dataset_name")
         self.model_name     = config.get("model_name")
         self.ratios         = config.get("split_ratios")
@@ -180,8 +186,8 @@ class SFTTrainer:
             b = {k: v.squeeze(1).to(self.device) for k,v in batch.items()}
             out_ids   = self.model.generate(**b, max_new_tokens=128)
             txt       = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
-            pred_ans  = txt.strip().split()[-1]
-            gold_ans  = self.val_answers[i].split()[-1]
+            pred_ans  = extract_predicted_answer(txt)
+            gold_ans  = extract_gold_answer(self.val_answers[i])
             
             # exact match
             if pred_ans == gold_ans:
@@ -264,7 +270,7 @@ class SFTTrainer:
 
             # validation
             val_l, val_a = self.evaluate()
-            print(f"→ [Val] Loss: {val_l:.4f} | Acc: {val_a:.2f}%")
+            print(f"Val Loss: {val_l:.4f} | Acc: {val_a:.2f}%")
             self.val_loss.append(val_l)
             self.val_acc.append(val_a)
 
@@ -279,6 +285,20 @@ class SFTTrainer:
         # verify final save
         if self._verify_save(self.output_dir):
             print(f"Final model saved & verified in {self.output_dir}")
+
+        evaluator = ModelEvaluator(
+            config    = self.config,      # keep a copy in __init__: self.config = config
+            device    = self.device,
+            model     = self.model,       # pass in-memory model
+            tokenizer = self.tokenizer    # pass in-memory tokenizer
+            # ckpt_dir = self.output_dir  # (alternate: load from disk instead)
+        )
+        test_metrics = evaluator.evaluate(num_samples=5)  # prints 5 examples
+
+        print(
+            f"Test Accuracy: {test_metrics['test_accuracy']:.2f}% "
+            f"on {test_metrics['test_samples']} samples"
+        )
 
         # finally, save plots
         self._save_plots()

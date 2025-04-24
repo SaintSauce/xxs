@@ -1,3 +1,4 @@
+import re
 from datasets import load_dataset
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
@@ -74,3 +75,12 @@ def get_dataloader(
         pin_memory=pin_memory,
         drop_last=drop_last
     )
+
+def extract_predicted_answer(text: str) -> str:
+    # find all integer matches (including negative)
+    nums = re.findall(r"-?\d+", text)
+    return nums[-1] if nums else ""
+
+def extract_gold_answer(gold: str) -> str:
+    nums = re.findall(r"-?\d+", gold)
+    return nums[-1] if nums else ""
