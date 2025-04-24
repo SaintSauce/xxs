@@ -15,7 +15,9 @@ from transformers import (
 from xxs.utils.data import (
     load_split_dataset_from_hf,
     format_cot_prompt,
-    get_dataloader
+    get_dataloader,
+    extract_gold_answer,
+    extract_predicted_answer
 )
 from xxs.evaluation.eval_model import ModelEvaluator
 
@@ -49,7 +51,7 @@ class PPOTrainer:
         self.save_interval = int(config.get("save_interval", 50))
 
         # output directory
-        raw_dir = config.get("rl_output_dir", "ppo_ckpt")
+        raw_dir = config.get("ppo_output_dir", "ppo_ckpt")
         repo_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..", "..")
         )
@@ -111,7 +113,9 @@ class PPOTrainer:
         )
         rl_raw = splits["rl_train"]
 
-        self.gold_answers = [ex["answer"].strip() for ex in rl_raw]
+        self.gold_answers = [
+            extract_gold_answer(ex["answer"].strip()) for ex in rl_raw
+        ]
 
         def prep_rl(ex):
             prompt = format_cot_prompt(ex["question"])
@@ -134,6 +138,7 @@ class PPOTrainer:
             k: v.squeeze(1).to(self.device) for k, v in batch.items()
         }
 
+        # generate CoT sequences
         gen_out = self.policy.generate(
             **b,
             do_sample=True,
@@ -148,6 +153,7 @@ class PPOTrainer:
         log_probs = []
         input_lens = (b["input_ids"] != self.tokenizer.pad_token_id).sum(dim=-1)
         
+        # compute log-probs of CoT sequences
         for i, scores in enumerate(gen_out.scores):
             token_ids = seqs[:, input_lens[0] + i].unsqueeze(-1)
             step_lp = F.log_softmax(scores, dim=-1).gather(1, token_ids)
@@ -162,9 +168,10 @@ class PPOTrainer:
         
         final_rewards = []
         
+        # compute final-answer reward
         for s, gold in zip(seqs, self.gold_answers):
             txt = self.tokenizer.decode(s, skip_special_tokens=True)
-            pred = txt.strip().split()[-1]
+            pred = extract_predicted_answer(txt)
             final_rewards.append(1.0 if pred == gold else 0.0)
         
         final_rewards = torch.tensor(final_rewards, device=self.device)
@@ -172,7 +179,7 @@ class PPOTrainer:
         verifier_bonus = []
         
         # verifier loaded in train()
-        for s in seqs:
+        for idx, s in enumerate(seqs):
             txt = self.tokenizer.decode(s, skip_special_tokens=True)
             cot = txt.split("A:")[-1]
             steps = [step.strip() for step in cot.split('.') if step.strip()]
@@ -183,11 +190,11 @@ class PPOTrainer:
                 max_length=64,
                 return_tensors="pt"
             ).to(self.device)
-            
+
             with torch.no_grad():
                 logits = self.verifier(**enc).logits
                 probs = torch.softmax(logits, dim=-1)[:, 1]
-            
+
             verifier_bonus.append(probs.mean())
         
         verifier_bonus = torch.stack(verifier_bonus).to(self.device) * self.alpha
@@ -248,33 +255,59 @@ class PPOTrainer:
         self.prepare_data()
 
         for update in range(self.max_updates):
-            batch = next(iter(self.loader))
+
+            # start of a new epoch
+            if update % len(self.loader) == 0:
+                data_iter = iter(self.loader)
+
+            # get batch
+            batch = next(data_iter)
+
+            # generate CoT sequences and compute log-probs of those sequences
             seqs, old_logp = self._generate_batch(batch)
+
+            # compute final-answer reward + verifier bonus - KL penalty
             rewards = self._compute_rewards(seqs, old_logp)
+
+            # compute returns and advantages
             returns = rewards.flip(0).cumsum(0).flip(0)
             advantages = returns - returns.mean()
+
+            # update metrics
             self.metrics['total_reward'].append(rewards.mean().item())
 
+            # PPO update loop
             for _ in range(self.ppo_epochs):
-                _, new_logp = self._generate_batch(batch)
+
+                # generate CoT sequences and compute log-probs of those sequences
+                seqs, new_logp = self._generate_batch(batch)
+
+                # compute ratio
                 ratio = (new_logp - old_logp).exp()
                 clipped = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps)
                 obj = torch.min(ratio * advantages, clipped * advantages)
                 loss = -obj.mean()
+
+                # update policy
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
                 self.scheduler.step()
+
+                # update metrics
                 self.metrics['surrogate_loss'].append(loss.item())
 
+            # save model
             if update % self.save_interval == 0:
                 ckpt = os.path.join(self.output_dir, f"update_{update}")
                 self.policy.save_pretrained(ckpt)
                 self.tokenizer.save_pretrained(ckpt)
 
+        # save final model
         self.policy.save_pretrained(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
 
+        # evaluate final model
         evaluator = ModelEvaluator(
             config=self.config,
             device=self.device,
