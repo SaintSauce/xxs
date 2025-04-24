@@ -145,11 +145,10 @@ class SFTTrainer:
         # val_gen loader (for accuracy)
         def prep_val(ex):
             prompt = format_cot_prompt(ex["question"])
-            tk = self.tokenizer(
+            return self.tokenizer(
                 prompt,
                 return_tensors="pt"
             )
-            return tk
 
         val_gen_ds = val_raw.map(prep_val, remove_columns=val_raw.column_names)
         val_gen_ds.set_format(type="torch",
@@ -184,12 +183,8 @@ class SFTTrainer:
         correct = 0
 
         for i, batch in enumerate(self.val_loader):
-            b = {
-                k: v.squeeze(1).to(self.device) for k,v in batch.items()
-            }
-            out_ids   = self.model.generate(**b, max_new_tokens=128,
-                                            eos_token_id=self.tokenizer.eos_token_id,
-                                            pad_token_id=self.tokenizer.pad_token_id)
+            b = {k: v.squeeze(1).to(self.device) for k,v in batch.items()}
+            out_ids   = self.model.generate(**b, max_new_tokens=128)
             txt       = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
             pred_ans  = extract_predicted_answer(txt)
             gold_ans  = extract_gold_answer(self.val_answers[i])
@@ -298,7 +293,7 @@ class SFTTrainer:
             tokenizer = self.tokenizer    # pass in-memory tokenizer
             # ckpt_dir = self.output_dir  # (alternate: load from disk instead)
         )
-        test_metrics = evaluator.evaluate(num_samples=5)  # prints 5 examples
+        test_metrics = evaluator.evaluate(0)  # prints 5 examples
 
         print(
             f"Test Accuracy: {test_metrics['test_accuracy']:.2f}% "
