@@ -7,6 +7,7 @@ from xxs.utils.config import ConfigLoader
 from xxs.models.load_model import HFModelLoader
 
 from xxs.utils.data import format_cot_prompt, extract_predicted_answer, extract_gold_answer
+
 class ModelEvaluator:
     """ model evaluator """
 
@@ -123,7 +124,7 @@ class ModelEvaluator:
                 print(f"\n[{j}] Q: {q}\nGenerated:\n{gen}\nGold Answer: {gold}")
 
         # accuracy
-        acc = correct / total * 100
+        acc = float(correct) / float(total) * 100
         print(f"Test Accuracy: {acc:.2f}% on {total} samples")
 
         return {
