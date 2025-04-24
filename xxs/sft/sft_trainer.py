@@ -81,6 +81,8 @@ class SFTTrainer:
         
         self.model, self.tokenizer = self.model_loader.load()
 
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
         # splits
         splits = load_split_dataset_from_hf(
             dataset_name=self.dataset_name,
@@ -173,6 +175,7 @@ class SFTTrainer:
 
         # validation loss
         total_loss, count = 0.0, 0
+        
         for batch in self.val_loss_loader:
             b = {
                 k: v.to(self.device) for k,v in batch.items()
@@ -180,14 +183,22 @@ class SFTTrainer:
             out = self.model(**b)
             total_loss += out.loss.item()
             count += 1
+
         avg_loss = total_loss / count
 
         # exact-match accuracy
         correct = 0
 
         for i, batch in enumerate(self.val_loader):
-            b = {k: v.squeeze(1).to(self.device) for k,v in batch.items()}
-            out_ids   = self.model.generate(**b, max_new_tokens=128)
+            b = {
+                k: v.squeeze(1).to(self.device) for k,v in batch.items()
+            }
+            out_ids   = self.model.generate(**b, 
+                                            max_new_tokens=128,
+                                            # stop the spam
+                                            eos_token_id=self.tokenizer.eos_token_id,
+                                            pad_token_id=self.tokenizer.pad_token_id
+            )
             txt       = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
             pred_ans  = extract_predicted_answer(txt)
             gold_ans  = extract_gold_answer(self.val_answers[i])
