@@ -28,7 +28,7 @@ ppo_output_dir: "checkpoints/ppo_checkpoint"
 grpo_output_dir: "checkpoints/grpo_checkpoint"
 verifier_dir: "checkpoints/verifier_ckpt_from_answer"
 
-# RL (PPO & G-RPO) hyperparameters
+# RL (PPO & GRPO) hyperparameters
 rl_batch_size:      8           # how many prompts per RL update
 rl_learning_rate:   1e-5        # AdamW LR for PPO
 rl_warmup_steps:    200         # warmup for the RL scheduler

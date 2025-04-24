@@ -59,32 +59,25 @@ class PPOTrainer:
         os.makedirs(self.output_dir, exist_ok=True)
 
         # load policy and reference from local SFT checkpoint
-        sft_rel = config.get("sft_output_dir", "sft_checkpoint")
-        sft_dir = os.path.join(repo_root, sft_rel)
-        
+        sft_dir = config.get("sft_output_dir")
         print(f"Loading SFT checkpoint from {sft_dir}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            sft_dir,
-            trust_remote_code=True,
-            local_files_only=True
+            sft_dir, 
+            local_files_only=True, 
+            trust_remote_code=True
         )
-
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # use bfloat16 if supported
-        self.policy = AutoModelForCausalLM.from_pretrained(
-            sft_dir,
-            local_files_only=True,
+        
+        self.policy    = AutoModelForCausalLM.from_pretrained(
+            sft_dir, 
+            local_files_only=True, 
             trust_remote_code=True,
             torch_dtype=torch.bfloat16
         ).to(self.device)
-
-        # reference for KL penalty
+        
         self.reference = AutoModelForCausalLM.from_pretrained(
-            sft_dir,
-            local_files_only=True,
+            sft_dir, 
+            local_files_only=True, 
             trust_remote_code=True,
             torch_dtype=torch.bfloat16
         ).to(self.device)
@@ -251,17 +244,15 @@ class PPOTrainer:
     def train(self):
         from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
         
-        repo_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..")
-        )
-        verifier_dir = os.path.join(repo_root, "verifier_ckpt_from_answer")
+        verifier_dir = self.config.get("verifier_dir")
 
         self.verifier_tok = DistilBertTokenizerFast.from_pretrained(
-            verifier_dir,
+            verifier_dir,   
             local_files_only=True
         )
+
         self.verifier = DistilBertForSequenceClassification.from_pretrained(
-            verifier_dir,
+            verifier_dir, 
             local_files_only=True
         ).to(self.device)
         
