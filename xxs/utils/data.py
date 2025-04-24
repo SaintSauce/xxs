@@ -1,7 +1,7 @@
 from datasets import load_dataset
 from datasets import DatasetDict
 from torch.utils.data import DataLoader
-
+ 
 def load_split_dataset_from_hf(
     dataset_name: str,
     seed: int = 42,
@@ -29,7 +29,7 @@ def load_split_dataset_from_hf(
         seed=seed
     )
     rl_train   = rem_split["train"]
-    validation = rem_split["test"]
+    val = rem_split["test"]
 
     # official test split untouched
     test_set = ds["test"]
@@ -38,7 +38,7 @@ def load_split_dataset_from_hf(
         {
             "sft_train": sft_train,
             "rl_train": rl_train,
-            "validation": validation,
+            "val": val,
             "test": test_set
         }
     )
