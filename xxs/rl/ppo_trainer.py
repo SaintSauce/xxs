@@ -53,7 +53,7 @@ class PPOTrainer:
         # output directory
         raw_dir = config.get("ppo_output_dir", "ppo_ckpt")
         repo_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..")
+            os.path.join(os.path.dirname(__file__), "..", "..")
         )
         self.output_dir = os.path.join(repo_root, raw_dir)
         os.makedirs(self.output_dir, exist_ok=True)

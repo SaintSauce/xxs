@@ -34,8 +34,8 @@ rl_learning_rate:   1e-5        # AdamW LR for PPO
 rl_warmup_steps:    200         # warmup for the RL scheduler
 ppo_epochs:         4           # inner PPO epochs
 ppo_clip_eps:       0.2         # PPO clipping ε
-gamma:              0.99        # discount for returns (not used here?)
-gae_lambda:         0.95        # GAE λ (if you ever implement GAE)
+gamma:              0.99        # discount for returns
+gae_lambda:         0.95        # GAE λ
 kl_coef:            0.1         # β for KL penalty
 verifier_coef:      0.5         # α for verifier bonus
 max_updates:        1000        # total RL “updates”
