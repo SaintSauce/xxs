@@ -318,21 +318,21 @@ class PPOTrainer:
                 ckpt = os.path.join(self.output_dir, f"update_{update}")
                 self.policy.save_pretrained(
                     ckpt,
-                    safe_serialization=True
+                    safe_serialization=False
                 )
                 self.tokenizer.save_pretrained(
                     ckpt,
-                    safe_serialization=True
+                    safe_serialization=False
                 )
 
         # save final model
         self.policy.save_pretrained(
             self.output_dir,
-            safe_serialization=True
+            safe_serialization=False
         )
         self.tokenizer.save_pretrained(
             self.output_dir,
-            safe_serialization=True
+            safe_serialization=False
         )
 
         # evaluate final model

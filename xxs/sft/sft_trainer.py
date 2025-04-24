@@ -283,11 +283,11 @@ class SFTTrainer:
             ckpt = os.path.join(self.output_dir, f"epoch{epoch}")
             self.model.save_pretrained(
                 ckpt,
-                safe_serialization=True
+                safe_serialization=False
             )
             self.tokenizer.save_pretrained(
                 ckpt,
-                safe_serialization=True
+                safe_serialization=False
             )
             print(f"Saved checkpoint: {ckpt}")
 
@@ -304,11 +304,11 @@ class SFTTrainer:
         # final save
         self.model.save_pretrained(
             self.output_dir,
-            safe_serialization=True
+            safe_serialization=False
         )
         self.tokenizer.save_pretrained(
             self.output_dir,
-            safe_serialization=True
+            safe_serialization=False
         )
 
         # verify final save

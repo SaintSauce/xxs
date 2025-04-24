@@ -343,6 +343,6 @@ class GRPOTrainer:
         # Save final model and plots
         self.model.save_pretrained(
             self.output_dir,
-            safe_serialization=True
+            safe_serialization=False
         )
         self._save_plots()
