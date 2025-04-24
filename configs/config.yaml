@@ -26,3 +26,17 @@ num_workers: 4
 sft_output_dir: "sft_checkpoint"
 ppo_output_dir: "ppo_checkpoint"
 grpo_output_dir: "grpo_checkpoint"
+
+# RL (PPO & G-RPO) hyperparameters
+rl_batch_size:      8           # how many prompts per RL update
+rl_learning_rate:   1e-5        # AdamW LR for PPO
+rl_warmup_steps:    200         # warmup for the RL scheduler
+ppo_epochs:         4           # inner PPO epochs
+ppo_clip_eps:       0.2         # PPO clipping ε
+gamma:              0.99        # discount for returns (not used here?)
+gae_lambda:         0.95        # GAE λ (if you ever implement GAE)
+kl_coef:            0.1         # β for KL penalty
+verifier_coef:      0.5         # α for verifier bonus
+max_updates:        1000        # total RL “updates”
+save_interval:      50          # how often to checkpoint
+gen_max_new_tokens: 128         # how many tokens to sample in RL
