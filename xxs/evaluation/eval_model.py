@@ -103,7 +103,8 @@ class ModelEvaluator:
             out = self.model.generate(
                 **b,
                 max_new_tokens=128,
-                pad_token_id=(self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
             )
 
             # decode
