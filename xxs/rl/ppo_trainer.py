@@ -122,7 +122,15 @@ class PPOTrainer:
 
         def prep_rl(ex):
             prompt = format_cot_prompt(ex["question"])
-            return self.tokenizer(prompt, return_tensors="pt")
+            
+            # pad / truncate to a fixed length so every sample in a batch is equal-sized
+            return self.tokenizer(
+                prompt,
+                truncation=True,            # cut off if it is longer than max_length
+                padding="max_length",       # pad with PAD-/EOS-token up to max_length
+                max_length=self.max_length, # 512 in your config
+                return_tensors="pt"
+            )
 
         rl_ds = rl_raw.map(prep_rl, remove_columns=rl_raw.column_names)
         rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
