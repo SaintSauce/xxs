@@ -54,7 +54,6 @@ class SFTTrainer:
 
         # metrics history
         self.epochs         = []
-        self.train_steps    = []
         self.train_loss     = []
         self.val_loss       = []
         self.val_acc        = []
@@ -198,9 +197,9 @@ class SFTTrainer:
         
         # loss curve
         plt.figure(figsize=(8,6))
-        plt.plot(self.train_steps, self.train_loss, label="Train Loss")
-        plt.plot(self.epochs,      self.val_loss,   label="Val Loss", marker="o")
-        plt.xlabel("Update Step / Epoch")
+        plt.plot(self.epochs, self.train_loss, label="Train Loss", marker="o")
+        plt.plot(self.epochs, self.val_loss,   label="Val Loss", marker="o")
+        plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.legend()
         plt.title("SFT Loss Curve")
@@ -232,11 +231,10 @@ class SFTTrainer:
             num_training_steps=total_steps
         )
 
-        global_step = 0
-
         for epoch in range(1, self.num_epochs + 1):
             self.epochs.append(epoch)
             running_loss = 0.0
+            num_batches = 0
 
             for step, batch in enumerate(self.loader, start=1):
                 b = {
@@ -246,22 +244,17 @@ class SFTTrainer:
                 loss = out.loss / self.grad_accum
                 loss.backward()
                 running_loss += loss.item()
+                num_batches += 1
 
                 if step % self.grad_accum == 0:
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
-                    global_step += 1
 
-                    if global_step % 50 == 0:
-                        avg = running_loss / 50
-                        
-                        print(f"[Epoch {epoch}] Step {global_step} | avg loss: {avg:.4f}")
-                        
-                        # record train metrics
-                        self.train_steps.append(global_step)
-                        self.train_loss.append(avg)
-                        running_loss = 0.0
+            # Calculate average loss for this epoch
+            avg_epoch_loss = running_loss / num_batches
+            self.train_loss.append(avg_epoch_loss)
+            print(f"[Epoch {epoch}] Average loss: {avg_epoch_loss:.4f}")
 
             # checkpoint
             ckpt = os.path.join(self.output_dir, f"epoch{epoch}")
