@@ -244,13 +244,18 @@ class PPOTrainer:
     def train(self):
         from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
         
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..","..",".."))
+        verifier_dir = os.path.join(repo_root, "verifier_ckpt_from_answer")
+
         # load verifier tokenizer and model
         self.verifier_tok = DistilBertTokenizerFast.from_pretrained(
-            'verifier_ckpt_from_answer'
+            verifier_dir,
+            local_files_only=True
         )
 
         self.verifier = DistilBertForSequenceClassification.from_pretrained(
-            'verifier_ckpt_from_answer'
+            verifier_dir,
+            local_files_only=True
         ).to(self.device)
         
         self.verifier.eval()
