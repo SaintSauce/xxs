@@ -2,7 +2,6 @@ import os, logging
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
@@ -24,19 +23,19 @@ class GRPOTrainer:
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"Initialising GRPO trainer on {device}")
 
-        self.cfg   = config
+        self.cfg = config
         self.device = device
-        self.seed   = int(config.get("seed"))
+        self.seed = int(config.get("seed"))
         self.max_len = int(config.get("max_length"))
         self.gen_len = int(config.get("gen_max_new_tokens", 128))
 
-        self.batch_size   = int(config.get("rl_batch_size"))
-        self.lr           = float(config.get("rl_learning_rate", 1e-5))
-        self.epochs       = int(config.get("grpo_epochs", 1))
-        self.beta         = float(config.get("kl_coef", 0.1))
-        self.alpha        = float(config.get("verifier_coef", 0.5))
-        self.max_updates  = int(config.get("max_updates", 1000))
-        self.save_every   = int(config.get("save_interval", 50))
+        self.batch_size = int(config.get("rl_batch_size"))
+        self.lr = float(config.get("rl_learning_rate", 1e-5))
+        self.epochs = int(config.get("grpo_epochs", 1))
+        self.beta = float(config.get("kl_coef", 0.1))
+        self.alpha = float(config.get("verifier_coef", 0.5))
+        self.max_updates = int(config.get("max_updates", 1000))
+        self.save_every = int(config.get("save_interval", 50))
 
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.out_dir = os.path.join(root, config.get("grpo_output_dir", "grpo_ckpt"))
@@ -100,21 +99,24 @@ class GRPOTrainer:
             return tok
 
         rl_ds = rl_raw.map(_preproc, remove_columns=rl_raw.column_names)
-        rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "gold"])
+
         self.loader = get_dataloader(
             rl_ds, batch_size=self.batch_size, shuffle=True,
             num_workers=int(self.cfg.get("num_workers", 4))
         )
+        
         self.logger.info(f"{len(rl_ds)} RL prompts loaded.")
 
     @torch.no_grad()
-    def _log_prob(self, model, seqs):
+    def _log_prob(self, model, seqs, prompt_len: int):
 
         # add attention mask
         attention_mask = (seqs != self.tokenizer.pad_token_id).long()
         
         # compute log probabilities for sequences
         lbl = seqs.clone()
+        lbl[:, :prompt_len] = -100
         lbl[lbl == self.tokenizer.pad_token_id] = -100
         
         with torch.autocast(device_type=self.device.type, enabled=False):
@@ -126,59 +128,68 @@ class GRPOTrainer:
         return torch.nan_to_num(lp, nan=-1e4, posinf=1e4, neginf=-1e4)
 
     def _sample_batch(self, batch):
-        # generate sequences from policy model
+        """ sample a batch of sequences from the policy model """
+        
+        # only keep the two tensors generate() needs
         inp = {
-            k: v.unsqueeze(1).to(self.device) for k, v in batch.items()
+            "input_ids":      batch["input_ids"].to(self.device),
+            "attention_mask": batch["attention_mask"].to(self.device),
         }
-        
-        # Ensure input_ids has the right shape
-        if inp["input_ids"].dim() == 2:
-            inp["input_ids"] = inp["input_ids"].unsqueeze(0)
-        
-        # Add attention mask if not present
-        if "attention_mask" not in inp:
-            inp["attention_mask"] = torch.ones_like(inp["input_ids"])
-        
+
         self.policy.eval()
         
         with torch.no_grad():
             seqs = self.policy.generate(
                 **inp,
-                do_sample=False,
+                do_sample=True,
+                top_k=50,
+                temperature=1.0,
                 max_new_tokens=self.gen_len,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
-                return_dict_in_generate=False
+                return_dict_in_generate=False,
             )
         
         self.policy.train()
-
+        
         return seqs
 
-    def _compute_reward(self, seqs):
+    def _compute_reward(self, seqs, gold_list):
         # compute final answer reward
         final_r = []
-        for s, gold in zip(seqs, self.gold_answers):
+        for s, gold in zip(seqs, gold_list):
             pred = extract_predicted_answer(
                 self.tokenizer.decode(s, skip_special_tokens=True)
             )
             final_r.append(1.0 if pred == gold else 0.0)
         final_r = torch.tensor(final_r, device=self.device)
 
-        # compute verifier bonus
+        decoded = [self.tokenizer.decode(s, skip_special_tokens=True) for s in seqs]
+        all_steps, counts = [], []
+        
+        for txt in decoded:
+            steps = [st.strip() for st in txt.split("A:")[-1].split('.') if st.strip()]
+            counts.append(len(steps))
+            all_steps.extend(steps)
+
+        enc = self.verifier_tok(
+            all_steps, padding=True, truncation=True, max_length=64,
+            return_tensors="pt"
+        ).to(self.device)
+        
+        with torch.no_grad():
+            logits = self.verifier(**enc).logits
+            probs  = torch.softmax(logits, dim=-1)[:, 1]
+
         bonus = []
-        for s in seqs:
-            cot = self.tokenizer.decode(s, skip_special_tokens=True).split("A:")[-1]
-            steps = [t.strip() for t in cot.split('.') if t.strip()]
-            enc = self.verifier_tok(
-                steps, padding=True, truncation=True, max_length=64,
-                return_tensors="pt"
-            ).to(self.device)
-            with torch.no_grad():
-                logits = self.verifier(**enc).logits
-                probs  = torch.softmax(logits, -1)[:, 1]
-            bonus.append(probs.mean())
-        bonus = torch.stack(bonus).to(self.device) * self.alpha
+        idx = 0
+        
+        for c in counts:
+            bonus.append(probs[idx:idx+c].mean())
+            idx += c
+        
+        bonus = torch.stack(bonus) * self.alpha
+        
         return final_r + bonus
 
     def train(self):
@@ -198,38 +209,54 @@ class GRPOTrainer:
             except StopIteration:
                 data_iter = iter(self.loader)
                 batch = next(data_iter)
+
+            batch_gold = batch["gold"] # shape (B,)
+
+            # draw K samples per prompt
+            K = 4
+            all_seqs = []
             
-            batch.pop("attention_mask", None)
-            batch_gold = batch.pop("gold", None) # maybe for later
-
-            # sample and compute log probabilities
-            seqs         = self._sample_batch(batch)
-            old_logp_pol = self._log_prob(self.policy,     seqs)
-            logp_ref     = self._log_prob(self.reference,  seqs)
-
-            # compute reward and kl divergence
-            R = self._compute_reward(seqs)
-            KL = torch.nan_to_num(old_logp_pol - logp_ref, nan=0.0)
-            reward = R - self.beta * KL
-
-            # compute importance weights
-            w = torch.exp(reward).clamp(1e-4, 1e4)
-            w = w / w.mean().clamp(min=1e-8)
-
-            # compute policy loss
-            labels = seqs.clone()
-            labels[labels == self.tokenizer.pad_token_id] = -100
-
-            attention_mask = (seqs != self.tokenizer.pad_token_id).long()
-
-            out = self.policy(input_ids=seqs, attention_mask=attention_mask, labels=labels)
+            # remove gold from the batch dict before sampling
+            batch_copy = {k: v for k, v in batch.items() if k != "gold"}
             
-            logp = -F.cross_entropy(
-                out.logits.transpose(1, 2), labels,
-                reduction="none", ignore_index=-100
-            ).sum(1)
+            for _ in range(K):
+                seq_k = self._sample_batch(batch_copy)
+                all_seqs.append(seq_k)
+            
+            # all_seqs: list of K tensors (B, L) → stack to (B, K, L)
+            all_seqs = torch.stack(all_seqs, dim=1)
 
-            loss = -(w * logp).mean()
+            # expand each gold answer K times so we have B*K gold labels
+            flat_gold = []
+
+            for g in batch_gold:
+                flat_gold.extend([g] * K) # now len(flat_gold) == B*K
+
+            # all inputs were padded/truncated to the same prompt length
+            prompt_len = int((batch["attention_mask"][0] == 1).sum().item())
+            
+            # flatten B×K for log-prob calls
+            flat_seqs = all_seqs.view(-1, all_seqs.size(-1)) # (B*K, L)
+            flat_old_lp = self._log_prob(self.policy, flat_seqs, prompt_len).detach()
+            flat_ref_lp = self._log_prob(self.reference, flat_seqs, prompt_len).detach()
+            old_lp = flat_old_lp.view(-1, K) # (B, K)
+            ref_lp = flat_ref_lp.view(-1, K)
+
+            # compute per-candidate rewards (batched verifier)
+            flat_R = self._compute_reward(flat_seqs, flat_gold) # (B*K,)
+            R = flat_R.view(-1, K) # (B, K)
+
+            # compute true group-relative weights
+            KL = (old_lp - ref_lp).clamp(min=0) # (B, K)
+            raw = R - self.beta * KL # (B, K)
+            w = torch.softmax(raw / self.alpha, dim=1) # normalize across K
+
+            # compute new log-probs under current policy
+            flat_new_lp = self._log_prob(self.policy, flat_seqs, prompt_len)
+            new_lp = flat_new_lp.view(-1, K) # (B, K)
+
+            # GRPO loss: weighted sum over group
+            loss = - (w * new_lp).sum(dim=1).mean()
 
             # skip batch if loss is invalid
             if torch.isnan(loss) or torch.isinf(loss):
@@ -242,7 +269,8 @@ class GRPOTrainer:
             self.opt.step(); self.scheduler.step()
 
             # log metrics and save checkpoints
-            self.metrics["total_reward"].append(reward.mean().item())
+            self.metrics["total_reward"].append(R.mean().item())
+
             if upd % 10 == 0:
                 self.logger.info(
                     f"Upd {upd}/{self.max_updates} • "
