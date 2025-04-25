@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 from transformers import PreTrainedTokenizer
 from xxs.utils.config import ConfigLoader
 from xxs.models.load_model import HFModelLoader
+import logging
 
 from xxs.utils.data import format_cot_prompt, extract_predicted_answer, extract_gold_answer
 
@@ -19,6 +20,13 @@ class ModelEvaluator:
         tokenizer: Optional[PreTrainedTokenizer] = None,
         ckpt_dir: Optional[str] = None
     ):
+        # Set up logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        self.logger = logging.getLogger(__name__)
+        
         self.config = config
         self.device = device
 
@@ -33,14 +41,17 @@ class ModelEvaluator:
 
         if model is not None and tokenizer is not None:
             # use the in‐memory SFT model
+            self.logger.info("Using provided in-memory model and tokenizer")
             self.model, self.tokenizer = model, tokenizer
         elif ckpt_dir is not None:
             # load from disk
+            self.logger.info(f"Loading model and tokenizer from checkpoint: {ckpt_dir}")
             from transformers import AutoModelForCausalLM, AutoTokenizer
             self.model = AutoModelForCausalLM.from_pretrained(ckpt_dir).to(device)
             self.tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
         else:
             # original behavior
+            self.logger.info(f"Loading model and tokenizer from HF: {config.get('model_name_of_model_to_evaluate')}")
             self.model_loader = HFModelLoader(
                 model_name=config.get("model_name_of_model_to_evaluate"),
                 device=device
@@ -48,13 +59,14 @@ class ModelEvaluator:
             self.model, self.tokenizer = self.model_loader.load()
 
     def prepare_test_data(self):
-
+        self.logger.info(f"Loading test dataset: {self.dataset_name}")
         # load test split directly
         ds = load_dataset(self.dataset_name, "main")
         test_raw = ds["test"]
 
         self.test_questions = [ex["question"].strip() for ex in test_raw]
         self.test_answers   = [ex["answer"].strip() for ex in test_raw]
+        self.logger.info(f"Loaded {len(self.test_questions)} test examples")
 
         # tokenization for generation
         def prep_test(ex):
@@ -78,21 +90,25 @@ class ModelEvaluator:
             num_workers=self.num_workers,
             pin_memory=True
         )
+        self.logger.info("Test data preparation completed")
 
     @torch.no_grad()
     def evaluate(self, num_samples: int = 5) -> Dict[str, float]:
+        self.logger.info("Starting model evaluation")
 
         # prepare test data
         if self.test_loader is None:
             self.prepare_test_data()
 
         self.model.eval()
+        self.logger.info("Model set to evaluation mode")
 
         correct, total = 0, len(self.test_answers)
-
         samples: List[tuple] = []
 
         for i, batch in enumerate(self.test_loader):
+            if i % 100 == 0:
+                self.logger.info(f"Processing example {i}/{total}")
             
             # move to device
             b = {
@@ -120,13 +136,13 @@ class ModelEvaluator:
                 samples.append((self.test_questions[i], text, self.test_answers[i]))
 
         if samples:
-            print(f"\n--- Showing {len(samples)} sample generations ---")
+            self.logger.info(f"\n--- Showing {len(samples)} sample generations ---")
             for j, (q, gen, gold) in enumerate(samples, 1):
-                print(f"\n[{j}] Q: {q}\nGenerated:\n{gen}\nGold Answer: {gold}")
+                self.logger.info(f"\n[{j}] Q: {q}\nGenerated:\n{gen}\nGold Answer: {gold}")
 
         # accuracy
         acc = float(correct) / float(total) * 100
-        print(f"Test Accuracy: {acc:.2f}% on {total} samples")
+        self.logger.info(f"Test Accuracy: {acc:.2f}% on {total} samples")
 
         return {
             "test_accuracy": acc, 
