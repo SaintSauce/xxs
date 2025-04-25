@@ -1,348 +1,277 @@
-import os
-import math
+import os, logging
+from collections import defaultdict
+
 import torch
-import numpy as np
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from transformers import (
-    get_linear_schedule_with_warmup
+    AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 )
-from torch.optim import AdamW
+
 from xxs.utils.data import (
-    load_split_dataset_from_hf,
-    format_cot_prompt,
-    combine_prompt_answer,
-    get_dataloader
+    load_split_dataset_from_hf, format_cot_prompt, get_dataloader,
+    extract_gold_answer, extract_predicted_answer
 )
-from xxs.utils.config import ConfigLoader
-from xxs.models.load_model import HFModelLoader
+from xxs.evaluation.eval_model import ModelEvaluator
 
 class GRPOTrainer:
-    """ generalized reward-penalty optimization trainer for RL fine-tuning """
-    
-    def __init__(self, config: ConfigLoader, device: torch.device):
-        
-        # load config fields
-        self.dataset_name   = config.get("dataset_name")
-        self.model_name     = config.get("model_name")
-        self.ratios         = config.get("split_ratios")
-        self.seed           = int(config.get("seed"))
-        self.max_length     = int(config.get("max_length"))
-        self.batch_size     = int(config.get("batch_size"))
-        self.num_workers    = int(config.get("num_workers"))
-        self.lr             = float(config.get("learning_rate"))
-        self.weight_decay   = float(config.get("weight_decay"))
-        self.num_epochs     = int(config.get("num_epochs"))
-        self.grad_accum     = int(config.get("grad_accum_steps"))
-        self.warmup_steps   = int(config.get("warmup_steps"))
-        
-        # GRPO specific parameters
-        self.grpo_epochs    = int(config.get("grpo_epochs", 4))
-        self.clip_epsilon   = float(config.get("clip_epsilon", 0.2))
-        self.gamma          = float(config.get("gamma", 0.99))
-        self.lam            = float(config.get("lam", 0.95))
-        self.entropy_coef   = float(config.get("entropy_coef", 0.01))
-        self.value_coef     = float(config.get("value_coef", 0.5))
-        self.penalty_coef   = float(config.get("penalty_coef", 0.1))  # coefficient for penalty term
-
-        raw_output_dir      = config.get("grpo_output_dir", "grpo_checkpoint")
-        repo_root           = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..","..","..")
+    def __init__(self, config, device: torch.device):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s"
         )
-        self.output_dir     = os.path.join(repo_root, raw_output_dir)
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        self.device         = device
-        self.model_loader   = HFModelLoader(self.model_name, device)
-
-        # placeholders
-        self.tokenizer      = None
-        self.loader         = None
-        self.val_loader     = None
-        self.val_answers    = None
-        self.model          = None
-        self.old_model      = None  # for GRPO
-
-        # metrics history
-        self.epochs         = []
-        self.train_steps    = []
-        self.train_loss     = []
-        self.val_loss       = []
-        self.val_acc        = []
-        self.returns        = []  # for tracking returns
-        self.advantages     = []  # for tracking advantages
-        self.penalties      = []  # for tracking penalties
-
-    def _verify_save(self, save_dir: str) -> bool:
-        required = [
-            "config.json", "pytorch_model.bin",
-            "tokenizer_config.json", "vocab.json",
-            "merges.txt", "special_tokens_map.json"
-        ]
         
-        for fn in required:
-            if not os.path.exists(os.path.join(save_dir, fn)):
-                print(f"Warning: missing {fn} in {save_dir}")
-                return False
+        self.logger = logging.getLogger(__name__)
+        self.logger.info(f"Initialising GRPO trainer on {device}")
+
+        self.cfg   = config
+        self.device = device
+        self.seed   = int(config.get("seed"))
+        self.max_len = int(config.get("max_length"))
+        self.gen_len = int(config.get("gen_max_new_tokens", 128))
+
+        self.batch_size   = int(config.get("rl_batch_size"))
+        self.lr           = float(config.get("rl_learning_rate", 1e-5))
+        self.epochs       = int(config.get("grpo_epochs", 1))
+        self.beta         = float(config.get("kl_coef", 0.1))
+        self.alpha        = float(config.get("verifier_coef", 0.5))
+        self.max_updates  = int(config.get("max_updates", 1000))
+        self.save_every   = int(config.get("save_interval", 50))
+
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        self.out_dir = os.path.join(root, config.get("grpo_output_dir", "grpo_ckpt"))
+        os.makedirs(self.out_dir, exist_ok=True)
+        sft_dir = config.get("sft_output_dir")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            sft_dir, local_files_only=True, trust_remote_code=True
+        )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        return True
+        self.tokenizer.padding_side = "right"
+
+        self.policy = AutoModelForCausalLM.from_pretrained(
+            sft_dir, local_files_only=True, trust_remote_code=True,
+            torch_dtype=torch.float32,
+            attn_implementation="eager"
+        ).to(device)
+
+        self.reference = AutoModelForCausalLM.from_pretrained(
+            sft_dir, local_files_only=True, trust_remote_code=True,
+            torch_dtype=torch.float32,
+            attn_implementation="eager"
+        ).to(device)
+        self.reference.eval()
+
+        self.opt = torch.optim.AdamW(self.policy.parameters(), lr=self.lr)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.opt,
+            num_warmup_steps=int(config.get("rl_warmup_steps", 200)),
+            num_training_steps=self.max_updates
+        )
+
+        self.loader, self.gold_answers = None, []
+        self.metrics = defaultdict(list)
 
     def prepare_data(self):
-        """ load model & tokenizer, split data, and build loaders """
-        
-        self.model, self.tokenizer = self.model_loader.load()
-        self.old_model = self.model_loader.load()[0]  # create copy for GRPO
-
-        # splits
+        self.logger.info(f"Loading dataset {self.cfg['dataset_name']}")
         splits = load_split_dataset_from_hf(
-            dataset_name=self.dataset_name,
+            dataset_name=self.cfg["dataset_name"],
             seed=self.seed,
-            sft_ratio=self.ratios["sft"],
-            rl_ratio=self.ratios["rl"],
-            val_ratio=self.ratios["val"]
+            sft_ratio=self.cfg["split_ratios"]["sft"],
+            rl_ratio=self.cfg["split_ratios"]["rl"],
+            val_ratio=self.cfg["split_ratios"]["val"]
         )
         rl_raw = splits["rl_train"]
-        val_raw = splits["val"]
+        self.gold_answers = [extract_gold_answer(x["answer"].strip()) for x in rl_raw]
 
-        # RL loader
-        def prep_rl(ex):
+        def _preproc(ex):
             prompt = format_cot_prompt(ex["question"])
-            return self.tokenizer(
-                prompt, truncation=True, padding="max_length",
-                max_length=self.max_length, return_tensors="pt"
+            tok = self.tokenizer(
+                prompt,
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_len,
+                return_tensors="pt",
             )
+            tok = {k: v.squeeze(0) for k, v in tok.items()}
+            tok["gold"] = extract_gold_answer(ex["answer"].strip())
+            return tok
 
-        rl_ds = rl_raw.map(prep_rl, remove_columns=rl_raw.column_names)
+        rl_ds = rl_raw.map(_preproc, remove_columns=rl_raw.column_names)
         rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        
         self.loader = get_dataloader(
-            rl_ds, batch_size=self.batch_size,
-            shuffle=True, num_workers=self.num_workers,
-            pin_memory=True, drop_last=True
+            rl_ds, batch_size=self.batch_size, shuffle=True,
+            num_workers=int(self.cfg.get("num_workers", 4))
         )
-
-        # val loader (for accuracy)
-        def prep_val(ex):
-            prompt = format_cot_prompt(ex["question"])
-            return self.tokenizer(
-                prompt, truncation=True, padding="max_length",
-                max_length=self.max_length, return_tensors="pt"
-            )
-
-        val_ds = val_raw.map(prep_val, remove_columns=val_raw.column_names)
-        val_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
-        
-        self.val_loader = get_dataloader(
-            val_ds, batch_size=1,
-            shuffle=False, num_workers=self.num_workers,
-            pin_memory=True
-        )
-
-        # gold answers for accuracy
-        self.val_answers = [ex["answer"].strip() for ex in val_raw]
-
-    def compute_returns_and_advantages(self, rewards, values, dones):
-        """ compute returns and advantages using GAE """
-        
-        returns = []
-        advantages = []
-        gae = 0
-        
-        for t in reversed(range(len(rewards))):
-            if t == len(rewards) - 1:
-                next_value = 0
-                next_done = 1
-            else:
-                next_value = values[t + 1]
-                next_done = dones[t + 1]
-            
-            delta = rewards[t] + self.gamma * next_value * (1 - next_done) - values[t]
-            gae = delta + self.gamma * self.lam * (1 - next_done) * gae
-            returns.insert(0, gae + values[t])
-            advantages.insert(0, gae)
-        
-        return torch.tensor(returns), torch.tensor(advantages)
-
-    def compute_penalty(self, logprobs, old_logprobs, actions):
-        """ compute penalty term based on action distribution divergence """
-        
-        # KL divergence between current and old policy
-        kl_div = (old_logprobs - logprobs).exp() * (old_logprobs - logprobs)
-        
-        # additional penalty for actions that deviate too much from the old policy
-        action_penalty = torch.abs(actions - torch.mean(actions, dim=1, keepdim=True))
-        return (kl_div + action_penalty).mean()
-
-    def grpo_loss(self, logprobs, old_logprobs, advantages, values, returns, actions):
-        """ compute GRPO loss with penalty term """
-        
-        # PPO-like policy loss
-        ratio = torch.exp(logprobs - old_logprobs)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
-        
-        # Value loss
-        value_loss = 0.5 * (returns - values).pow(2).mean()
-        
-        # Entropy loss
-        entropy_loss = -logprobs.mean()
-        
-        # Penalty term
-        penalty = self.compute_penalty(logprobs, old_logprobs, actions)
-        
-        return (policy_loss + 
-                self.value_coef * value_loss - 
-                self.entropy_coef * entropy_loss + 
-                self.penalty_coef * penalty)
+        self.logger.info(f"{len(rl_ds)} RL prompts loaded.")
 
     @torch.no_grad()
-    def evaluate(self):
-        """Return (val_loss, val_accuracy) for current model"""
-        self.model.eval()
+    def _log_prob(self, model, seqs):
+
+        # add attention mask
+        attention_mask = (seqs != self.tokenizer.pad_token_id).long()
         
-        # exact-match accuracy
-        correct = 0
-        for i, batch in enumerate(self.val_loader):
-            b = {k: v.squeeze(1).to(self.device) for k,v in batch.items()}
-            out_ids = self.model.generate(**b, max_new_tokens=128)
-            txt = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
-            pred_ans = txt.strip().split()[-1]
-            gold_ans = self.val_answers[i].split()[-1]
-            
-            if pred_ans == gold_ans:
-                correct += 1
+        # compute log probabilities for sequences
+        lbl = seqs.clone()
+        lbl[lbl == self.tokenizer.pad_token_id] = -100
         
-        acc = correct / len(self.val_loader) * 100
-        self.model.train()
-        return 0.0, acc  # No loss computation in GRPO evaluation
-
-    def _save_plots(self):
-        """ plot & save training metrics """
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            out = model(input_ids=seqs, attention_mask=attention_mask, labels=lbl)
         
-        # loss curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.train_steps, self.train_loss, label="Train Loss")
-        plt.xlabel("Update Step")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.title("GRPO Loss Curve")
-        plt.savefig(os.path.join(self.output_dir, "loss_curve.png"))
-        plt.close()
+        valid_len = (lbl != -100).sum(dim=1)
+        lp = -out.loss * valid_len
+        
+        return torch.nan_to_num(lp, nan=-1e4, posinf=1e4, neginf=-1e4)
 
-        # returns curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.train_steps, self.returns, label="Returns")
-        plt.xlabel("Update Step")
-        plt.ylabel("Returns")
-        plt.title("GRPO Returns")
-        plt.legend()
-        plt.savefig(os.path.join(self.output_dir, "returns_curve.png"))
-        plt.close()
+    def _sample_batch(self, batch):
+        # generate sequences from policy model
+        inp = {
+            k: v.unsqueeze(1).to(self.device) for k, v in batch.items()
+        }
+        
+        # Ensure input_ids has the right shape
+        if inp["input_ids"].dim() == 2:
+            inp["input_ids"] = inp["input_ids"].unsqueeze(0)
+        
+        # Add attention mask if not present
+        if "attention_mask" not in inp:
+            inp["attention_mask"] = torch.ones_like(inp["input_ids"])
+        
+        self.policy.eval()
+        
+        with torch.no_grad():
+            seqs = self.policy.generate(
+                **inp,
+                do_sample=False,
+                max_new_tokens=self.gen_len,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+                return_dict_in_generate=False
+            )
+        
+        self.policy.train()
 
-        # penalties curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.train_steps, self.penalties, label="Penalties")
-        plt.xlabel("Update Step")
-        plt.ylabel("Penalty")
-        plt.title("GRPO Penalties")
-        plt.legend()
-        plt.savefig(os.path.join(self.output_dir, "penalties_curve.png"))
-        plt.close()
+        return seqs
 
-        # accuracy curve
-        plt.figure(figsize=(8,6))
-        plt.plot(self.epochs, self.val_acc, marker="o", label="Val Accuracy")
-        plt.xlabel("Epoch")
-        plt.ylabel("Accuracy (%)")
-        plt.title("Validation Accuracy")
-        plt.legend()
-        plt.savefig(os.path.join(self.output_dir, "accuracy_curve.png"))
-        plt.close()
+    def _compute_reward(self, seqs):
+        # compute final answer reward
+        final_r = []
+        for s, gold in zip(seqs, self.gold_answers):
+            pred = extract_predicted_answer(
+                self.tokenizer.decode(s, skip_special_tokens=True)
+            )
+            final_r.append(1.0 if pred == gold else 0.0)
+        final_r = torch.tensor(final_r, device=self.device)
+
+        # compute verifier bonus
+        bonus = []
+        for s in seqs:
+            cot = self.tokenizer.decode(s, skip_special_tokens=True).split("A:")[-1]
+            steps = [t.strip() for t in cot.split('.') if t.strip()]
+            enc = self.verifier_tok(
+                steps, padding=True, truncation=True, max_length=64,
+                return_tensors="pt"
+            ).to(self.device)
+            with torch.no_grad():
+                logits = self.verifier(**enc).logits
+                probs  = torch.softmax(logits, -1)[:, 1]
+            bonus.append(probs.mean())
+        bonus = torch.stack(bonus).to(self.device) * self.alpha
+        return final_r + bonus
 
     def train(self):
-        """ run GRPO training with per-epoch validation and final plotting """
-        
-        optimizer = AdamW(self.model.parameters(),
-                         lr=self.lr,
-                         weight_decay=self.weight_decay)
-        
-        total_steps = math.ceil(len(self.loader)/self.grad_accum) * self.num_epochs
-        
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=total_steps
-        )
+        from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
+        vdir = self.cfg["verifier_dir"]
+        self.verifier_tok = DistilBertTokenizerFast.from_pretrained(vdir, local_files_only=True)
+        self.verifier = DistilBertForSequenceClassification.from_pretrained(vdir, local_files_only=True).to(self.device)
+        self.verifier.eval()
 
-        global_step = 0
+        self.prepare_data()
+        data_iter = iter(self.loader)
 
-        for epoch in range(1, self.num_epochs + 1):
-            self.epochs.append(epoch)
-            running_loss = 0.0
+        # Main training loop
+        for upd in range(self.max_updates):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(self.loader)
+                batch = next(data_iter)
+            
+            batch.pop("attention_mask", None)
+            batch_gold = batch.pop("gold", None) # maybe for later
 
-            for step, batch in enumerate(self.loader, start=1):
-                b = {k: v.to(self.device) for k,v in batch.items()}
-                
-                # Generate responses and compute rewards
-                with torch.no_grad():
-                    self.old_model.eval()
-                    old_outputs = self.old_model(**b)
-                    old_logprobs = old_outputs.logits.log_softmax(dim=-1)
-                    old_values = old_outputs.value
-                    old_actions = old_outputs.logits.argmax(dim=-1)
-                
-                self.model.train()
-                outputs = self.model(**b)
-                logprobs = outputs.logits.log_softmax(dim=-1)
-                values = outputs.value
-                actions = outputs.logits.argmax(dim=-1)
-                
-                # Compute rewards (placeholder - implement your reward function)
-                rewards = torch.ones_like(values)  # Replace with actual reward computation
-                dones = torch.zeros_like(rewards)
-                
-                # Compute returns and advantages
-                returns, advantages = self.compute_returns_and_advantages(
-                    rewards, values, dones
+            # sample and compute log probabilities
+            seqs         = self._sample_batch(batch)
+            old_logp_pol = self._log_prob(self.policy,     seqs)
+            logp_ref     = self._log_prob(self.reference,  seqs)
+
+            # compute reward and kl divergence
+            R = self._compute_reward(seqs)
+            KL = torch.nan_to_num(old_logp_pol - logp_ref, nan=0.0)
+            reward = R - self.beta * KL
+
+            # compute importance weights
+            w = torch.exp(reward).clamp(1e-4, 1e4)
+            w = w / w.mean().clamp(min=1e-8)
+
+            # compute policy loss
+            labels = seqs.clone()
+            labels[labels == self.tokenizer.pad_token_id] = -100
+
+            attention_mask = (seqs != self.tokenizer.pad_token_id).long()
+
+            out = self.policy(input_ids=seqs, attention_mask=attention_mask, labels=labels)
+            
+            logp = -F.cross_entropy(
+                out.logits.transpose(1, 2), labels,
+                reduction="none", ignore_index=-100
+            ).sum(1)
+
+            loss = -(w * logp).mean()
+
+            # skip batch if loss is invalid
+            if torch.isnan(loss) or torch.isinf(loss):
+                self.logger.warning("NaN/Inf loss – batch skipped"); continue
+
+            # update model parameters
+            self.opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+            self.opt.step(); self.scheduler.step()
+
+            # log metrics and save checkpoints
+            self.metrics["total_reward"].append(reward.mean().item())
+            if upd % 10 == 0:
+                self.logger.info(
+                    f"Upd {upd}/{self.max_updates} • "
+                    f"R̄={R.mean():.3f}  KL={KL.mean():.3f}  w̄={w.mean():.2f}"
                 )
-                
-                # Normalize advantages
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                
-                # GRPO loss
-                loss = self.grpo_loss(logprobs, old_logprobs, advantages, values, returns, actions)
-                loss = loss / self.grad_accum
-                loss.backward()
-                
-                running_loss += loss.item()
-                
-                if step % self.grad_accum == 0:
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    
-                    global_step += 1
-                    self.train_steps.append(global_step)
-                    self.train_loss.append(running_loss / self.grad_accum)
-                    self.returns.append(returns.mean().item())
-                    self.advantages.append(advantages.mean().item())
-                    self.penalties.append(self.compute_penalty(logprobs, old_logprobs, actions).item())
-                    
-                    running_loss = 0.0
-                    
-                    # Update old model
-                    self.old_model.load_state_dict(self.model.state_dict())
-            
-            # Evaluate at end of epoch
-            val_loss, val_acc = self.evaluate()
-            self.val_loss.append(val_loss)
-            self.val_acc.append(val_acc)
-            
-            print(f"Epoch {epoch}: Val Acc = {val_acc:.2f}%")
-        
-        # Save final model and plots
-        self.model.save_pretrained(
-            self.output_dir,
-            safe_serialization=False
+            if upd % self.save_every == 0:
+                ck = os.path.join(self.out_dir, f"update_{upd}")
+                self.policy.save_pretrained(ck, safe_serialization=False)
+                self.tokenizer.save_pretrained(ck, safe_serialization=False)
+
+        # save final model and evaluate
+        self.policy.save_pretrained(self.out_dir, safe_serialization=False)
+        self.tokenizer.save_pretrained(self.out_dir, safe_serialization=False)
+
+        evaluator = ModelEvaluator(
+            config=self.cfg, device=self.device,
+            model=self.policy, tokenizer=self.tokenizer
         )
-        self._save_plots()
+        res = evaluator.evaluate(num_samples=0)
+        self.logger.info(f"GRPO finished • Test-Acc {res['test_accuracy']:.2f}%")
+
+        self._plot()
+
+    def _plot(self):
+        
+        # plot training metrics
+        if not self.metrics["total_reward"]:
+            return
+        plt.figure(); plt.plot(self.metrics["total_reward"])
+        plt.title("Average reward"); plt.xlabel("update"); plt.ylabel("R̄")
+        plt.savefig(os.path.join(self.out_dir, "reward_curve.png"))
+        plt.close()
