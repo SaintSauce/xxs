@@ -1,11 +1,8 @@
 import os
-import math
 import logging
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from transformers import (
     AutoModelForCausalLM,
@@ -26,11 +23,13 @@ class PPOTrainer:
     """ ppo trainer """
 
     def __init__(self, config, device: torch.device):
+        
         # Set up logging
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
+
         self.logger = logging.getLogger(__name__)
 
         # store config and device
@@ -61,9 +60,11 @@ class PPOTrainer:
 
         # output directory
         raw_dir = config.get("ppo_output_dir", "ppo_ckpt")
+
         repo_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..")
         )
+        
         self.output_dir = os.path.join(repo_root, raw_dir)
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -170,7 +171,9 @@ class PPOTrainer:
         with torch.no_grad():
             seqs = self.policy.generate(
                 **b,
-                do_sample=False,
+                do_sample=True,
+                top_k=50,
+                temperature=1.0,
                 max_new_tokens=self.gen_max_new_tokens,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
@@ -180,22 +183,24 @@ class PPOTrainer:
         if (seqs != self.tokenizer.pad_token_id).sum() == 0:
             raise ValueError("all-PAD sequence – regenerate")
         
+        # all prompts are padded to max_length, so we can treat this as a scalar
+        prompt_len = int((b["attention_mask"] == 1).sum().item())
+        
         # stale log-probabilities (no grad) for PPO ratio
-        old_logp = self._log_prob(self.policy, seqs).detach()
+        old_logp = self._log_prob(self.policy, seqs, prompt_len).detach()
 
         self.policy.train()
 
-        return seqs, old_logp
+        return seqs, old_logp, prompt_len
     
-    def _log_prob(self, model, seqs):
-        """ compute total log-probability of `seqs` under `model` """
+    def _log_prob(self, model, seqs, prompt_len: int):
+        """ compute total log-probability of seqs under model """
 
         labels = seqs.clone()
+        labels[:, :prompt_len] = -100    # ignore prompt
         labels[labels == self.tokenizer.pad_token_id] = -100
 
-        # forward pass in fp32 for extra stability
-        with torch.autocast(device_type=self.device.type, enabled=False):
-            out = model(seqs, labels=labels)
+        out = model(seqs, labels=labels)
 
         valid_len = (labels != -100).sum(dim=1)
         logp = -out.loss * valid_len         # (B,)
@@ -205,62 +210,63 @@ class PPOTrainer:
         return logp
 
     def _compute_rewards(self, seqs, old_logp):
-        """ compute final-answer reward + verifier bonus - KL penalty """
-        
+        """ compute final-answer reward + batched verifier bonus (no KL here) """
+
+        # final-answer reward
         final_rewards = []
         
-        # compute final-answer reward
         for s, gold in zip(seqs, self.gold_answers):
             txt = self.tokenizer.decode(s, skip_special_tokens=True)
             pred = extract_predicted_answer(txt)
             final_rewards.append(1.0 if pred == gold else 0.0)
         
         final_rewards = torch.tensor(final_rewards, device=self.device)
-        self.logger.debug(f"Average final answer reward: {final_rewards.mean().item():.3f}")
-
-        verifier_bonus = []
-        
-        # verifier loaded in train()
-        for idx, s in enumerate(seqs):
-            txt = self.tokenizer.decode(s, skip_special_tokens=True)
-            cot = txt.split("A:")[-1]
-            steps = [step.strip() for step in cot.split('.') if step.strip()]
-            enc = self.verifier_tok(
-                steps,
-                padding=True,
-                truncation=True,
-                max_length=64,
-                return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                logits = self.verifier(**enc).logits
-                probs = torch.softmax(logits, dim=-1)[:, 1]
-
-            verifier_bonus.append(probs.mean())
-        
-        verifier_bonus = torch.stack(verifier_bonus).to(self.device) * self.alpha
-
-        with torch.no_grad():
-            kl_terms = (old_logp - self._ref_logp(seqs)).detach()
-            kl = kl_terms.mean() * self.beta
-
-            if torch.isnan(kl):                     # just in case
-                kl = torch.zeros_like(kl)
-
         self.metrics['answer_acc'].append(final_rewards.mean().item())
-        self.metrics['verifier_bonus'].append(verifier_bonus.mean().item())
-        self.metrics['kl_penalty'].append(kl.item())
 
-        return final_rewards + verifier_bonus - kl
+        # batched verifier bonus
+        # decode all at once
+        decoded = [self.tokenizer.decode(s, skip_special_tokens=True) for s in seqs]
+        all_steps, counts = [], []
+        
+        for txt in decoded:
+            steps = [st.strip() for st in txt.split("A:")[-1].split('.') if st.strip()]
+            counts.append(len(steps))
+            all_steps.extend(steps)
 
-    def _ref_logp(self, seqs):
+        # one big tokenization + forward
+        enc = self.verifier_tok(
+            all_steps,
+            padding=True,
+            truncation=True,
+            max_length=64,
+            return_tensors="pt"
+        ).to(self.device)
         with torch.no_grad():
-            return self._log_prob(self.reference, seqs).detach()
+            logits = self.verifier(**enc).logits
+            probs  = torch.softmax(logits, dim=-1)[:, 1]
+
+        # split back per-example
+        verifier_bonus = []
+        idx = 0
+        for c in counts:
+            verifier_bonus.append(probs[idx:idx+c].mean())
+            idx += c
+        verifier_bonus = torch.stack(verifier_bonus).to(self.device) * self.alpha
+        self.metrics['verifier_bonus'].append(verifier_bonus.mean().item())
+
+        # return only the task + verifier reward (KL moves into the PPO loss)
+        return final_rewards + verifier_bonus
+
+
+    def _ref_logp(self, seqs, prompt_len):
+        """ compute log-prob of seqs under reference model """
+
+        with torch.no_grad():
+            return self._log_prob(self.reference, seqs, prompt_len).detach()
 
     def _plot(self):
-        
-        # plot reward components over updates
+        """ plot reward components over updates """
+
         updates = range(len(self.metrics['total_reward']))
         
         plt.figure(figsize=(8, 5))
@@ -311,7 +317,7 @@ class PPOTrainer:
                 batch = next(data_iter)
 
             # generate CoT sequences and compute log-probs of those sequences
-            seqs, old_logp = self._generate_batch(batch)
+            seqs, old_logp, prompt_len = self._generate_batch(batch)
 
             if torch.isnan(old_logp).any() or torch.isinf(old_logp).any():
                 print(f"[warn] skipped bad batch at update {update}")
@@ -319,16 +325,33 @@ class PPOTrainer:
 
             old_logp = old_logp.detach()
 
-            # compute final-answer reward + verifier bonus - KL penalty
+            # compute final-answer reward + verifier bonus (KL handled in loss)
             rewards = self._compute_rewards(seqs, old_logp)
 
-            # compute returns and advantages
-            returns = rewards.flip(0).cumsum(0).flip(0)
+            with torch.no_grad():
+                ref_logp = self._ref_logp(seqs, prompt_len)
+            
+            kl_per_example = (old_logp - ref_logp).clamp(min=0)   # only positive KL
+            kl_loss = self.beta * kl_per_example.mean()
+            self.metrics['kl_penalty'].append(kl_loss.item())
+
+            def discount_cumsum(x, gamma):
+                """ compute discounted cumulative sums of x """
+
+                discount = torch.zeros_like(x)
+                running = 0.0
+                for t in reversed(range(len(x))):
+                    running = x[t] + gamma * running
+                    discount[t] = running
+
+                return discount
+            
+            returns = discount_cumsum(rewards, self.gamma)
             advantages = returns - returns.mean()
 
             # update metrics
             self.metrics['total_reward'].append(rewards.mean().item())
-            
+
             if update % 10 == 0:
                 self.logger.info(
                     f"Update {update}/{self.max_updates} - "
@@ -343,16 +366,16 @@ class PPOTrainer:
             # PPO update loop
             for _ in range(self.ppo_epochs):
                 # differentiable log-prob under the *current* policy
-                new_logp = self._log_prob(self.policy, seqs)   # <<< NEW
+                new_logp = self._log_prob(self.policy, seqs, prompt_len)
 
                 log_ratio = (new_logp - old_logp).clamp(-20, 20)  # keeps exp() finite
                 ratio = log_ratio.exp()
 
                 clipped = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps)
                 obj = torch.min(ratio * advantages, clipped * advantages)
-                loss = -obj.mean()
+                loss = -obj.mean() + kl_loss
 
-                if torch.isnan(loss) or torch.isinf(loss):      # 🆕 skip poisoned batch
+                if torch.isnan(loss) or torch.isinf(loss):
                     self.logger.warning("NaN/Inf loss – batch skipped")
                     continue
 
