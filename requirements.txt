@@ -6,10 +6,13 @@ python-dotenv
 # HF
 datasets
 transformers
+accelerate
 
 # EDA
 matplotlib
 seaborn
+pandas
+numpy
 
 # ML
 torch
