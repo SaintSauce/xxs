@@ -78,13 +78,19 @@ def get_dataloader(
 
 def extract_predicted_answer(text: str) -> str:
     """ extract predicted answer from text """
-
-    # find all integer matches (including negative)
-    nums = re.findall(r"-?\d+", text)
+    
+    # First try to find the last number after ####
+    if "####" in text:
+        after_hash = text.split("####")[-1].strip()
+        nums = re.findall(r"-?\d+\.?\d*", after_hash)
+        if nums:
+            return nums[-1]
+    
+    # If no #### found, look for the last number in the text
+    nums = re.findall(r"-?\d+\.?\d*", text)
     return nums[-1] if nums else ""
 
 def extract_gold_answer(gold: str) -> str:
     """ extract gold answer from text """
-
-    nums = re.findall(r"-?\d+", gold)
+    nums = re.findall(r"-?\d+\.?\d*", gold)
     return nums[-1] if nums else ""

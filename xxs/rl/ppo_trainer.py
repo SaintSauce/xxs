@@ -121,6 +121,7 @@ class PPOTrainer:
 
     def prepare_data(self):
         """ load RL prompts and build DataLoader of raw CoT prompts """
+
         self.logger.info(f"Loading dataset: {self.dataset_name}")
         
         splits = load_split_dataset_from_hf(
@@ -141,16 +142,26 @@ class PPOTrainer:
             prompt = format_cot_prompt(ex["question"])
             
             # pad / truncate to a fixed length so every sample in a batch is equal-sized
-            return self.tokenizer(
+            tok = self.tokenizer(
                 prompt,
-                truncation=True,            # cut off if it is longer than max_length
-                padding="max_length",       # pad with PAD-/EOS-token up to max_length
-                max_length=self.max_length, # 512 in your config
-                return_tensors="pt"
+                truncation=True,
+                padding="max_length",
+                max_length=self.max_length,
+                return_tensors="pt",
             )
 
+            return {
+                "input_ids": tok["input_ids"].squeeze(0),
+                "attention_mask": tok["attention_mask"].squeeze(0),
+                "gold": torch.tensor(
+                    int(extract_gold_answer(ex["answer"].strip())),
+                    dtype=torch.long
+                ),
+                "question": ex["question"]
+            }
+
         rl_ds = rl_raw.map(prep_rl, remove_columns=rl_raw.column_names)
-        rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        rl_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "gold", "question"])
 
         self.loader = get_dataloader(
             rl_ds,
@@ -162,29 +173,49 @@ class PPOTrainer:
     def _generate_batch(self, batch):
         """ generate CoT sequences and compute log-probs of those sequences """
 
-        b = {
-            k: v.squeeze(1).to(self.device) for k, v in batch.items()
-        }
+        # b = {
+        #     k: v.squeeze(1).to(self.device) for k, v in batch.items()
+        # }
+
+        # self.policy.eval()
+
+        # with torch.no_grad():
+        #     seqs = self.policy.generate(
+        #         **b,
+        #         do_sample=True,
+        #         top_k=40,
+        #         top_p=0.8,
+        #         temperature=0.8,
+        #         max_new_tokens=self.gen_max_new_tokens,
+        #         eos_token_id=self.tokenizer.eos_token_id,
+        #         pad_token_id=self.tokenizer.pad_token_id,
+        #         return_dict_in_generate=False,
+        #     )
+
+        input_ids = batch["input_ids"].to(self.device)
+        attention_mask = batch["attention_mask"].to(self.device)
 
         self.policy.eval()
-
+        
         with torch.no_grad():
             seqs = self.policy.generate(
-                **b,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 do_sample=True,
-                top_k=50,
-                temperature=1.0,
+                top_k=40,
+                top_p=0.8,
+                temperature=0.8,
                 max_new_tokens=self.gen_max_new_tokens,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id,
-                return_dict_in_generate=False,
             )
-        
+
+
         if (seqs != self.tokenizer.pad_token_id).sum() == 0:
             raise ValueError("all-PAD sequence – regenerate")
         
         # all prompts are padded to max_length, so we can treat this as a scalar
-        prompt_len = int((b["attention_mask"] == 1).sum().item())
+        prompt_len = int((attention_mask == 1).sum().item())
         
         # stale log-probabilities (no grad) for PPO ratio
         old_logp = self._log_prob(self.policy, seqs, prompt_len).detach()
@@ -319,6 +350,8 @@ class PPOTrainer:
             # generate CoT sequences and compute log-probs of those sequences
             seqs, old_logp, prompt_len = self._generate_batch(batch)
 
+            questions = batch["question"]
+
             if torch.isnan(old_logp).any() or torch.isinf(old_logp).any():
                 print(f"[warn] skipped bad batch at update {update}")
                 continue        # jumps to the next update
@@ -328,10 +361,28 @@ class PPOTrainer:
             # compute final-answer reward + verifier bonus (KL handled in loss)
             rewards = self._compute_rewards(seqs, old_logp)
 
+            gold_batch = batch["gold"]
+
+            if update % 100 == 0:
+                for idx in range(2):
+                    print(f"Question {idx+1}: {questions[idx]}")
+                    
+                    # strip off the prompt tokens from the full decoded sequence
+                    full = seqs[idx]
+                    gen_ids = full[prompt_len:].cpu().tolist()
+                    gen_text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    pred_ans = extract_predicted_answer(gen_text)
+                    gold_ans = gold_batch[idx]  # this is now aligned
+                    print(f"Sample {idx+1}: {gen_text}")
+                    print(f"  Predicted Answer: {pred_ans}")
+                    print(f"  Gold Answer:      {gold_ans}")
+                    print("------")
+
             with torch.no_grad():
                 ref_logp = self._ref_logp(seqs, prompt_len)
             
-            kl_per_example = (old_logp - ref_logp).clamp(min=0)   # only positive KL
+            # Compute KL(policy||reference) = E_policy[log policy - log reference]
+            kl_per_example = ref_logp - old_logp
             kl_loss = self.beta * kl_per_example.mean()
             self.metrics['kl_penalty'].append(kl_loss.item())
 

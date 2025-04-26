@@ -20,7 +20,7 @@ class ModelEvaluator:
         tokenizer: Optional[PreTrainedTokenizer] = None,
         ckpt_dir: Optional[str] = None
     ):
-        # Set up logging
+        # set up logging
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
